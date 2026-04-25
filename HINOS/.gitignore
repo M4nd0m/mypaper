@@ -1,0 +1,62 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and runtime artifacts
+*.log
+logs/
+tmp/
+temp/
+
+# Experiment outputs and cached matrices
+cache/
+emb/
+results/
+outputs/
+runs/
+checkpoints/
+
+# Large datasets and pretrained embeddings
+dataset/*
+!dataset/README*
+pretrain/
+
+# Common binary data/model artifacts
+*.emb
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.mat
+*.h5
+*.hdf5
+
+# Generated tables from local experiments
+*.csv
+*.tsv
+*.xlsx
+
+# Keep repository documentation trackable
+!README*
+!docs/**/*.csv

@@ -1,0 +1,1201 @@
+Chat 'ChatTitle(text="1" with Codex, isCustom=true)' (855623df-bdb4-40c2-b2fd-d96b716767d4)
+Context:
+
+Messages: 24
+===========================================================================================
+
+==== UserMessageImpl #1 ====
+User: 
+1
+
+kotlin.Unit
+
+==== AgentMessage #2 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #3 ====
+User: 
+阅读一下这个项目，看看为什么聚类效果不好
+
+kotlin.Unit
+
+==== AgentMessage #4 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #5 ====
+User: 
+这里delta是可学习的参数，不用管，你先阅读这个文件，再来分析原因
+Attachments:
+Attachment Name: current_plan_tppr_ncut.md
+Attachments Kind: Visible
+Attachments Source: User / FileChatAttachment
+Attachments Text:
+```markdown
+# 当前方案整理（基于师兄 offline 主线的简化版）
+
+## 1. 方案定位
+
+当前方案不再优先走“另起一套多阶段时序聚类框架”的路线，而是**紧贴师兄论文的 offline 主线**，在其基础上做针对性的改进。
+
+核心判断如下：
+
+1. 师兄的 offline 阶段，本质上可以理解为一个 **clustering-oriented 的 embedding optimization** 过程；
+2. 它和 DTGC 在训练逻辑上是相通的：先初始化 embedding，再把 embedding 当作可优化变量，通过损失函数不断更新；
+3. 师兄相对 DTGC 的关键变化，不是整体训练范式变了，而是**把原本的聚类损失替换成了基于 TPPR 的 Ncut**；
+4. 因此，我当前的工作重点不应是大幅改写整体框架，而应是：
+   - 保留师兄 offline 的主骨架；
+   - 围绕 **TPPR**、**Ncut**、以及“突变/过平滑”问题做最小而关键的增强。
+
+---
+
+## 2. 当前不优先采用的方案
+
+经过讨论，当前版本**暂不优先采用**以下设计：
+
+- 多阶段可训练表示矩阵 $Z_b$；
+- 多阶段软分配矩阵 $Q_b$；
+- 显式跨阶段 assignment consistency 项；
+- 重新搭建一整套 stage-wise temporal clustering 框架。
+
+原因不是这些设计没有道理，而是：
+
+1. 它们会显著增加模型复杂度；
+2. 会引入更多超参数与训练不稳定因素；
+3. 会削弱“这是在师兄基础上继续做”的自然性；
+4. 目前其收益是否明显高于复杂度成本，**尚无充分证据**。
+
+因此，当前阶段更稳妥的做法是：**先把主线收缩到师兄 offline 框架本身，再聚焦一个最关键的创新点。**
+
+---
+
+## 3. 当前方案的核心思想
+
+### 3.1 基本思路
+
+保留如下主线：
+
+1. 用 node2vec 或其他轻量方式初始化节点表示；
+2. 基于时间事件流和历史邻居关系，构造 temporal loss；
+3. 基于 TPPR 构造高阶时序相似图；
+4. 在该相似图上施加 Ncut 型社区目标；
+5. 用 batch-level reconstruction 保持局部结构；
+6. 直接优化 embedding 本身。
+
+因此，当前方案可以概括为：
+
+> 在“embedding 作为优化变量”的训练范式下，将 TPPR 提供的高阶时序结构信息与 Ncut 社区目标结合，并通过 temporal loss 与 batch reconstruction 共同约束 embedding，使 learned embedding 更适合 temporal graph clustering。
+
+---
+
+## 4. 模型变量与输入
+
+给定连续时间时序图：
+
+$$
+\mathcal{G} = (V, E)
+$$
+
+其中事件集合为：
+
+$$
+E = \{(u_r, v_r, t_r)\}_{r=1}^{M}
+$$
+
+节点初始表示记为：
+
+$$
+Z^{(0)} \in \mathbb{R}^{|V| \times d}.
+$$
+
+这里 $Z^{(0)}$ 可由 node2vec 或其他轻量预训练方式得到。
+
+训练中，真正被优化的是节点表示矩阵：
+
+$$
+Z \in \mathbb{R}^{|V| \times d}.
+$$
+
+也就是说，当前方案不强依赖一个复杂 encoder，而是直接把 embedding 视为优化对象。
+
+---
+
+## 5. TPPR 高阶时序相似图
+
+对原始事件流计算 TPPR，得到节点间的高阶时序相似性矩阵：
+
+$$
+\Pi \in \mathbb{R}^{|V| \times |V|}.
+$$
+
+其中，$\Pi_{ij}$ 表示节点 $i$ 到节点 $j$ 的高阶时序关联强度。
+
+在此基础上定义度矩阵：
+
+$$
+D_{\Pi} = \operatorname{diag}(\Pi \mathbf{1})
+$$
+
+该矩阵不是普通的一阶邻接，而是包含了时间顺序约束和高阶传播信息的 affinity graph，因此更适合作为 cut objective 的结构基础。
+
+---
+
+## 6. 当前方案的损失函数
+
+当前总目标函数写为：
+
+$$
+L = L_{\mathrm{temp}} + \lambda_{\mathrm{cut}} L_{\mathrm{cut}} + \lambda_{\mathrm{batch}} L_{\mathrm{batch}}.
+$$
+
+这里：
+
+- $L_{\mathrm{temp}}$：保持事件级时间动态；
+- $L_{\mathrm{cut}}$：在 TPPR 相似图上施加社区划分约束；
+- $L_{\mathrm{batch}}$：保留 batch 内局部连接结构。
+
+这个写法和师兄 offline 的主干高度一致，但当前研究重点会放在 **如何改进 $L_{\mathrm{cut}}$**，使其更适合你的问题设定。
+
+---
+
+## 7. Temporal loss
+
+对于一个事件 $(u, v, t)$，定义条件交互强度：
+
+$$
+\begin{aligned}
+s(u,v,t)
+= {} & \mu(u,v,t) \\
+& + \sum_{x \in N_{u,t}} w(x,u,t)\,\mu(x,v,t)\,
+\exp\bigl(-\delta_t (t - t_x)\bigr)
+\end{aligned}
+$$
+
+其中基础相似度可写为：
+
+$$
+\mu(u,v,t) = -\lVert z_u^t - z_v^t \rVert_2^2
+$$
+
+于是 temporal loss 写为：
+
+$$
+L_{\mathrm{temp}}
+= -\log \sigma\bigl(s(u,v,t)\bigr)
+  - \sum_{n \sim P(n)} \log \sigma\bigl(-s(u,n,t)\bigr)
+$$
+
+该项的作用是：
+
+- 提高真实交互节点对的打分；
+- 压低随机负样本的打分；
+- 让 embedding 保留事件序列中的时间依赖信息。
+
+这部分当前可以基本保留，不作为主要创新点。
+
+---
+
+## 8. TPPR-Ncut 社区损失
+
+### 8.1 当前写法
+
+在 embedding $Z$ 的基础上，通过一个轻量 assignment head 得到软分配矩阵：
+
+$$
+S = \operatorname{softmax}(\operatorname{MLP}(Z))
+$$
+
+然后在 TPPR 相似图 $\Pi$ 上定义 Ncut 型目标：
+
+$$
+L_{\mathrm{cut}}^{\mathrm{base}}
+= \operatorname{Tr}\!\Bigl(
+\bigl(S^\top D_{\Pi} S + \varepsilon I\bigr)^{-1}
+S^\top \bigl(D_{\Pi} - \Pi\bigr) S
+\Bigr)
+$$
+
+为防止塌缩解，再加入 balance penalty：
+
+$$
+L_{\mathrm{bal}}
+= \frac{1}{\sqrt{K} - 1}
+\left(
+\sqrt{K}
+- \frac{1}{\sqrt{2m_{\Pi}}}
+\sum_{j=1}^{K} \lVert s_j \odot d_{\Pi}^{1/2} \rVert_2
+\right)
+$$
+
+其中 $s_j$ 为 $S$ 的第 $j$ 列，$d_{\Pi}$ 为 TPPR 图上的度向量。
+
+因此，当前社区损失写作：
+
+$$
+L_{\mathrm{cut}} = L_{\mathrm{cut}}^{\mathrm{base}} + \lambda_p L_{\mathrm{bal}}
+$$
+
+### 8.2 这一项的定位
+
+这一项是当前方案里**最值得进一步改进的核心模块**。
+
+因为从现在的研究目标看，你真正想解决的问题并不是“有没有必要再造一个完整大框架”，而是：
+
+> 师兄当前的 TPPR-Ncut，在面对时序突变、社区边界变化、或者过平滑风险时，是否仍然足够好？
+
+因此，下一步更合理的工作重点应当是：
+
+- 改进 TPPR；或
+- 改进 Ncut；或
+- 改进二者之间的耦合方式。
+
+而不是优先引入大量新的 stage-wise 变量。
+
+---
+
+## 9. Batch reconstruction loss
+
+为了保持 batch 内部的局部邻接结构，定义：
+
+$$
+\begin{aligned}
+L_{\mathrm{batch}}
+= \frac{1}{|\mathcal{B}|}
+\sum_{(u,v,t)\in \mathcal{B}}
+\Biggl[
+& \bigl(1 - \operatorname{sim}(u,v,t)\bigr) \\
+& + \frac{1}{|N_{u,t}|} \sum_{h \in N_{u,t}} \bigl(1 - \operatorname{sim}(u,h,t)\bigr) \\
+& + \frac{1}{|\bar N_{u,t}|} \sum_{\bar h \in \bar N_{u,t}} \bigl| \operatorname{sim}(u,\bar h,t) \bigr|
+\Biggr]
+\end{aligned}
+$$
+
+该项作用是：
+
+1. 拉近当前交互节点对；
+2. 拉近历史邻居；
+3. 压低非邻居相似度。
+
+这一项仍可保留为辅助项，不需要在当前阶段大改。
+
+---
+
+## 10. 当前方案与 DTGC、师兄 offline 的关系
+
+### 10.1 与 DTGC 的关系
+
+当前方案与 DTGC 的相似之处在于：
+
+1. 都采用“初始化 embedding，然后不断优化 embedding”的训练逻辑；
+2. 都服务于 temporal graph clustering；
+3. 都不是单纯地先学表示、后面再完全独立聚类，而是让 clustering objective 参与表示优化。
+
+不同之处在于：
+
+1. DTGC 原始 clustering loss 不是 TPPR-Ncut；
+2. 当前方案的社区约束不是一般的节点分布校准，而是建立在 **TPPR 高阶时序相似图** 上的 cut objective；
+3. 当前方案更强调“高阶时序社区结构”，而非仅仅适配 batch-processing 的 clustering module。
+
+### 10.2 与师兄 offline 的关系
+
+当前方案与师兄 offline 更接近。
+
+可以理解为：
+
+> 保留师兄 offline 的基本训练范式，只把后续研究重点集中到“如何让 TPPR-Ncut 更适合你的问题设定”。
+
+因此，当前方案不是完全另起炉灶，而是**以师兄 offline 为主干、以 TPPR-Ncut 为核心、以最小代价往前推进**。
+
+---
+
+## 11. 当前阶段的研究重点
+
+基于目前讨论，当前阶段最合理的研究重点不应是“再造一个完整新框架”，而应是以下问题之一：
+
+### 方向一：改 TPPR
+
+核心问题：
+
+- TPPR 在突变阶段是否会过度继承旧历史；
+- TPPR 的时间衰减是否过于固定；
+- 高阶扩散是否会把突变边界抹平。
+
+如果答案是“会”，那么就可以从 TPPR 的转移概率、时间核、扩散范围控制等角度做改进。
+
+### 方向二：改 Ncut
+
+核心问题：
+
+- 当前 cut objective 是否默认偏好时间平滑；
+- 是否会对真实突变阶段产生过大惩罚；
+- 是否缺少对边界变化、簇分裂/合并的适应能力。
+
+如果答案是“会”，那么就可以围绕 TPPR-Ncut 的目标函数做修正。
+
+### 方向三：改二者耦合方式
+
+核心问题：
+
+- TPPR 提供的 affinity 与 Ncut 之间，现在是否只是“先算 affinity，再做 cut”；
+- 是否可以让 cut 对 TPPR 的构图偏好形成反向引导；
+- 是否可以设计更贴近社区边界的高阶扩散。
+
+这一方向更强，但也更难，是中后期可以考虑的升级方向。
+
+---
+
+## 12. 当前结论
+
+当前最稳妥、最符合研究目标的方案可以总结为：
+
+> 以师兄 offline 为基础，保留“初始化 embedding → 直接优化 embedding → temporal loss + TPPR-Ncut + batch reconstruction”的主骨架，不优先引入多阶段显式时序聚类变量，而是将创新重点集中到 TPPR 或 Ncut 的针对性改进上，特别关注突变场景下的过平滑与社区边界保持问题。
+
+这一路线的优点是：
+
+1. 与师兄工作衔接自然；
+2. 方法叙事更简洁；
+3. 更容易证明“这是合理推进，而不是另起炉灶”；
+4. 更适合后续逐步加入针对突变的最小增强模块。
+
+---
+
+## 13. 后续建议
+
+在当前方案基础上，下一步最值得优先明确的问题是：
+
+### 到底改 TPPR，还是改 Ncut？
+
+更具体地说，可以先回答：
+
+1. 你认为“突变”首先破坏的是高阶扩散，还是 cut 的平滑偏好？
+2. 你希望你的贡献更像“更好的时序相似图”，还是“更好的社区目标函数”？
+3. 你是想做“最小改动但扎实”，还是“结构更强但更复杂”的版本？
+
+只有这一点明确了，当前方案才会真正收束。
+
+```
+
+
+kotlin.Unit
+
+==== AgentMessage #6 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #7 ====
+User: 
+把你的意见写进md文档里
+
+kotlin.Unit
+
+==== AgentMessage #8 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #9 ====
+User: 
+把你的意见写进md文档里，新开一个md文档
+
+kotlin.Unit
+
+==== AgentMessage #10 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #11 ====
+User: 
+请你基于当前项目代码做一次“HTNcut 作为主聚类目标”的修改，不要重构整个项目，不要新增复杂模型，只围绕 loss、训练日志、评估方式和必要消融进行最小改动。
+
+背景：
+当前方法来自师兄 temporal community search 论文的 offline stage。原先 loss 大概是：
+L = L_temp + lambda_cut * L_cut + lambda_batch * L_batch
+
+但我现在的下游任务是 temporal graph clustering。我要验证 HTNcut 是否能作为聚类主目标，而不是只作为 embedding 的正则项。因此需要把训练目标改成 cut-main 版本：
+
+L_total = L_HTNcut(S, Pi)
+        + lambda_temp * L_temp
+        + lambda_batch * L_batch
+        + lambda_bal * L_bal
+
+其中：
+- L_HTNcut / L_cut 是主聚类目标；
+- L_temp 只是辅助保持事件级时序动态；
+- L_batch 只是辅助保持 batch 内局部结构；
+- L_bal 只用于防止塌缩，不能过强；
+- 最终主聚类结果应该来自 S 的 argmax，而不是只看 KMeans(Z)。
+
+请按下面要求修改。
+
+一、增加 cut-main 训练模式
+
+1. 在 config / argparse 中新增模式参数，例如：
+   --objective_mode cut_main
+
+2. 当 objective_mode == cut_main 时，loss 计算改为：
+   loss = loss_cut \
+        + lambda_temp * loss_temp \
+        + lambda_batch * loss_batch \
+        + lambda_bal * loss_bal
+
+3. 保留原来的训练模式，例如：
+   --objective_mode original
+   对应：
+   loss = loss_temp + lambda_cut * loss_cut + lambda_batch * loss_batch + ...
+
+4. 不要删除原逻辑。我要能通过命令行切换 original 和 cut_main。
+
+二、调整超参数默认值
+
+在 cut_main 模式下，不要再默认让 temporal loss 主导训练。
+
+请设置或支持下面的搜索范围：
+
+lambda_temp  in {0.001, 0.005, 0.01, 0.05, 0.1}
+lambda_batch in {0.001, 0.005, 0.01, 0.05, 0.1}
+lambda_bal   in {0, 0.001, 0.005, 0.01, 0.05}
+
+如果已有参数名字不同，请沿用现有命名，但语义要对应：
+- temporal loss 权重要小；
+- batch reconstruction 权重要小；
+- balance penalty 权重要小；
+- L_cut 默认系数为 1，不再用 lambda_cut 把它作为附属项。
+
+三、最终输出方式必须修改
+
+现在不能只报告 KMeans(Z)。
+
+请在每个评估点同时计算并保存以下结果：
+
+1. argmax(S)
+   - 这是 cut_main 模式的主结果。
+   - S = softmax(assignment_head(Z)) 或当前代码中对应的 soft assignment。
+   - pred_s = S.argmax(dim=1)
+
+2. KMeans(Z)
+   - 作为 embedding quality 的对照结果。
+   - 不再作为 cut_main 模式下的唯一主结果。
+
+3. KMeans(S)
+   - 用 assignment 概率空间做 KMeans，作为辅助对照。
+
+4. spectral clustering(Pi)
+   - 作为 TPPR affinity graph 本身的聚类上界诊断。
+   - 如果 Pi 是稀疏矩阵，要支持稀疏输入。
+   - 如果 Pi 是非对称矩阵，请额外支持：
+     Pi_sym = (Pi + Pi.T) / 2
+   - 同时支持 top-k Pi：
+     每行只保留 top-k affinity，再做谱聚类。
+   - 至少输出：
+     spectral(Pi_sym)
+     spectral(topk_Pi_sym)
+
+请把这些结果分别写入日志和 csv，例如字段：
+epoch,
+loss_total,
+loss_cut,
+loss_temp,
+loss_batch,
+loss_bal,
+weighted_temp,
+weighted_batch,
+weighted_bal,
+acc_argmax_s,
+nmi_argmax_s,
+ari_argmax_s,
+f1_argmax_s,
+acc_kmeans_z,
+nmi_kmeans_z,
+ari_kmeans_z,
+f1_kmeans_z,
+acc_kmeans_s,
+nmi_kmeans_s,
+ari_kmeans_s,
+f1_kmeans_s,
+acc_spectral_pi,
+nmi_spectral_pi,
+ari_spectral_pi,
+f1_spectral_pi,
+acc_spectral_topk_pi,
+nmi_spectral_topk_pi,
+ari_spectral_topk_pi,
+f1_spectral_topk_pi
+
+四、增加 Pi 图本身的诊断函数
+
+请新增一个独立诊断脚本或函数，例如：
+
+python diagnose_pi.py --dataset xxx --pi_path xxx --num_clusters K --topk 20
+
+功能：
+1. 读取 TPPR affinity matrix Pi；
+2. 计算 Pi 的基本统计：
+   - shape
+   - nnz
+   - density
+   - min / max / mean / std
+   - row sum min / max / mean
+   - 是否存在全零行
+   - 是否非对称
+3. 如果有 labels，计算：
+   - within-class mass = sum Pi_ij where y_i == y_j / sum Pi_ij
+   - between-class mass = sum Pi_ij where y_i != y_j / sum Pi_ij
+   - homophily_ratio = within_mass / (between_mass + eps)
+4. 做聚类上界诊断：
+   - spectral clustering on Pi_sym
+   - spectral clustering on topk Pi_sym
+   - KMeans on rows of Pi if size allows
+5. 输出 metrics 到 json/csv。
+
+这个诊断用于回答：
+- Pi 本身有没有聚类信息；
+- 如果 spectral(Pi) 都差，说明问题主要在 TPPR affinity；
+- 如果 spectral(Pi) 好但训练后差，说明问题主要在 loss / optimization / assignment head。
+
+五、增加 loss 尺度与梯度诊断
+
+训练时请打印并保存：
+
+1. 原始 loss：
+   - loss_cut
+   - loss_temp
+   - loss_batch
+   - loss_bal
+
+2. 加权后的 loss：
+   - 1.0 * loss_cut
+   - lambda_temp * loss_temp
+   - lambda_batch * loss_batch
+   - lambda_bal * loss_bal
+
+3. 如果实现成本不高，请增加梯度范数：
+   - grad_norm_cut
+   - grad_norm_temp
+   - grad_norm_batch
+   - grad_norm_bal
+
+梯度范数可以每隔 eval_interval 计算一次，不必每个 batch 都算，避免太慢。
+
+目标是判断：
+- cut_main 模式下，L_cut 是否真的在主导训练；
+- 是否虽然公式写成 L_cut + lambda L_temp，但实际 temporal loss 数值太大，仍然主导优化。
+
+六、增加训练流程选项
+
+请支持两种训练方式：
+
+方式 A：直接 cut-main
+从 epoch 0 开始：
+L = L_cut + lambda_temp L_temp + lambda_batch L_batch + lambda_bal L_bal
+
+方式 B：warmup + cut-main
+前 warmup_epochs：
+L = L_temp + lambda_batch L_batch
+
+之后：
+L = L_cut + lambda_temp L_temp + lambda_batch L_batch + lambda_bal L_bal
+
+新增参数：
+--warmup_epochs 0
+默认 0，即不 warmup。
+如果设为 20 或 30，则启用 warmup。
+
+七、增加最小消融实验入口
+
+请增加一个脚本或实验配置，至少能一键跑下面几组：
+
+1. original:
+   L = L_temp + lambda_cut L_cut + lambda_batch L_batch
+   main report = KMeans(Z)
+
+2. cut_main_no_aux:
+   L = L_cut + lambda_bal L_bal
+   main report = argmax(S)
+
+3. cut_main_temp:
+   L = L_cut + lambda_temp L_temp + lambda_bal L_bal
+   main report = argmax(S)
+
+4. cut_main_batch:
+   L = L_cut + lambda_batch L_batch + lambda_bal L_bal
+   main report = argmax(S)
+
+5. cut_main_full:
+   L = L_cut + lambda_temp L_temp + lambda_batch L_batch + lambda_bal L_bal
+   main report = argmax(S)
+
+每组都要输出：
+- argmax(S)
+- KMeans(Z)
+- KMeans(S)
+- spectral(Pi)
+- spectral(topk Pi)
+
+八、注意事项
+
+1. 不要把 HTNcut 只作为 lambda_cut 的附属项。
+   cut_main 模式下 L_cut 默认系数就是 1。
+
+2. 不要只看 KMeans(Z)。
+   cut_main 模式下主结果是 argmax(S)。
+
+3. 不要强行加大 balance penalty。
+   lambda_bal 先从很小的值开始试。
+
+4. 不要重写整个模型结构。
+   这次只做最小改动：
+   - loss 组合
+   - 输出方式
+   - Pi 诊断
+   - 日志
+   - 消融脚本
+
+5. 请保证原来的训练流程仍然可用，方便对照。
+
+九、请最后给我一个修改总结
+
+修改完成后，请按下面格式回复：
+
+1. Files changed
+- ...
+
+2. New arguments
+- --objective_mode
+- --lambda_temp
+- --lambda_batch
+- --lambda_bal
+- --warmup_epochs
+- ...
+
+3. Loss logic
+- original: ...
+- cut_main: ...
+
+4. Evaluation outputs
+- argmax(S)
+- KMeans(Z)
+- KMeans(S)
+- spectral(Pi)
+- spectral(topk Pi)
+
+5. New diagnostic scripts
+- diagnose_pi.py: ...
+
+6. How to run
+
+请给出示例命令，例如：
+
+python train.py \
+  --dataset school \
+  --objective_mode cut_main \
+  --lambda_temp 0.01 \
+  --lambda_batch 0.01 \
+  --lambda_bal 0.005 \
+  --warmup_epochs 20 \
+  --eval_interval 5
+
+以及：
+
+python diagnose_pi.py \
+  --dataset school \
+  --pi_path outputs/school/pi.npz \
+  --num_clusters 9 \
+  --topk 20请明确实现 L_bal，不要留成未定义符号。
+
+在 cut_main 模式中，L_bal 是一个 collapse-prevention / balance regularization，不是 HTNcut 本身。它只用于防止所有节点被 soft assignment 到同一个 cluster，因此权重 lambda_bal 必须很小。
+
+定义如下：
+
+给定：
+- S ∈ R^{N x K}，soft assignment matrix，S = softmax(assignment_head(Z))
+- Pi ∈ R^{N x N}，TPPR affinity matrix
+- d_pi = Pi @ ones，TPPR affinity graph 上的 degree / volume vector
+
+先计算每个 cluster 的 TPPR volume proportion：
+
+rho = (S.T @ d_pi) / (d_pi.sum() + eps)
+
+其中 rho ∈ R^K，rho_k 表示第 k 个 cluster 占到的 TPPR volume 比例。
+
+然后定义：
+
+L_bal = (sqrt(K) * ||rho||_2 - 1) / (sqrt(K) - 1 + eps)
+
+性质：
+- 如果 cluster volume 均匀，rho ≈ [1/K, ..., 1/K]，L_bal ≈ 0
+- 如果所有节点塌缩到一个 cluster，rho ≈ [1,0,...,0]，L_bal ≈ 1
+
+注意：
+1. 这是 degree-aware / volume-aware balance，不是普通 node-count balance。
+2. 它要和 HTNcut 的 volume-normalized 逻辑一致。
+3. lambda_bal 默认要很小，例如 0、0.001、0.005、0.01。
+4. 不要让 L_bal 强行主导训练，因为真实社区大小可能不均衡。
+5. 请在日志中输出 rho、rho_min、rho_max、rho_entropy 和 L_bal，方便判断是否发生 collapse。
+
+kotlin.Unit
+
+==== AgentMessage #12 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #13 ====
+User: 
+补充澄清：请不要同时实现两个不同版本的 L_bal。之前 prompt 末尾给出的 rho-based L_bal 版本请不要作为默认实现。请以 current_plan_tppr_ncut.md 中的 L_bal 公式为准，因为它不仅能防止所有节点塌缩到一个 cluster，也能惩罚所有节点对所有 cluster 都均匀软分配的无信息解。
+
+请在 cut_main 模式中这样定义 L_bal：
+
+给定：
+- S ∈ R^{N x K}，soft assignment matrix，S = softmax(assignment_head(Z))
+- Pi ∈ R^{N x N}，TPPR affinity matrix
+- d_pi = Pi @ ones，TPPR affinity graph 上的 degree / volume vector
+- s_j = S[:, j]
+- 2m_pi = d_pi.sum()
+
+定义：
+
+L_bal =
+1 / (sqrt(K) - 1 + eps)
+*
+(
+    sqrt(K)
+    -
+    1 / sqrt(2m_pi + eps)
+    *
+    sum_{j=1}^{K} || s_j * sqrt(d_pi) ||_2
+)
+
+也就是代码形式：
+
+d_pi = Pi @ ones
+two_m = d_pi.sum()
+weighted_norm_sum = 0
+for j in range(K):
+    weighted_norm_sum += torch.norm(S[:, j] * torch.sqrt(d_pi + eps), p=2)
+
+loss_bal = (
+    torch.sqrt(torch.tensor(float(K), device=S.device))
+    - weighted_norm_sum / torch.sqrt(two_m + eps)
+) / (
+    torch.sqrt(torch.tensor(float(K), device=S.device)) - 1.0 + eps
+)
+
+请注意：
+1. L_bal 不是 HTNcut 本身，只是 collapse-prevention regularization。
+2. lambda_bal 必须很小，例如 0、0.001、0.005、0.01。
+3. cut_main 模式下总损失仍然是：
+
+loss = loss_cut
+     + lambda_temp * loss_temp
+     + lambda_batch * loss_batch
+     + lambda_bal * loss_bal
+
+4. 请在日志中输出：
+   - loss_bal
+   - lambda_bal * loss_bal
+   - cluster_mass = S.sum(dim=0)
+   - cluster_volume = S.T @ d_pi
+   - cluster_volume_min
+   - cluster_volume_max
+   - cluster_volume_entropy
+   - assignment_entropy = mean entropy of S rows
+
+5. 如果当前代码已经根据 rho 实现了 L_bal，请改回上面的 weighted-norm 版本。
+
+kotlin.Unit
+
+==== AgentMessage #14 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #15 ====
+User: 
+补充澄清：请不要同时实现两个不同版本的 L_bal。之前 prompt 末尾给出的 rho-based L_bal 版本请不要作为默认实现。请以 current_plan_tppr_ncut.md 中的 L_bal 公式为准，因为它不仅能防止所有节点塌缩到一个 cluster，也能惩罚所有节点对所有 cluster 都均匀软分配的无信息解。
+
+请在 cut_main 模式中这样定义 L_bal：
+
+给定：
+- S ∈ R^{N x K}，soft assignment matrix，S = softmax(assignment_head(Z))
+- Pi ∈ R^{N x N}，TPPR affinity matrix
+- d_pi = Pi @ ones，TPPR affinity graph 上的 degree / volume vector
+- s_j = S[:, j]
+- 2m_pi = d_pi.sum()
+
+定义：
+
+L_bal =
+1 / (sqrt(K) - 1 + eps)
+*
+(
+    sqrt(K)
+    -
+    1 / sqrt(2m_pi + eps)
+    *
+    sum_{j=1}^{K} || s_j * sqrt(d_pi) ||_2
+)
+
+也就是代码形式：
+
+d_pi = Pi @ ones
+two_m = d_pi.sum()
+weighted_norm_sum = 0
+for j in range(K):
+    weighted_norm_sum += torch.norm(S[:, j] * torch.sqrt(d_pi + eps), p=2)
+
+loss_bal = (
+    torch.sqrt(torch.tensor(float(K), device=S.device))
+    - weighted_norm_sum / torch.sqrt(two_m + eps)
+) / (
+    torch.sqrt(torch.tensor(float(K), device=S.device)) - 1.0 + eps
+)
+
+请注意：
+1. L_bal 不是 HTNcut 本身，只是 collapse-prevention regularization。
+2. lambda_bal 必须很小，例如 0、0.001、0.005、0.01。
+3. cut_main 模式下总损失仍然是：
+
+loss = loss_cut
+     + lambda_temp * loss_temp
+     + lambda_batch * loss_batch
+     + lambda_bal * loss_bal
+
+4. 请在日志中输出：
+   - loss_bal
+   - lambda_bal * loss_bal
+   - cluster_mass = S.sum(dim=0)
+   - cluster_volume = S.T @ d_pi
+   - cluster_volume_min
+   - cluster_volume_max
+   - cluster_volume_entropy
+   - assignment_entropy = mean entropy of S rows
+
+5. 如果当前代码已经根据 rho 实现了 L_bal，请改回上面的 weighted-norm 版本。
+
+kotlin.Unit
+
+==== AgentMessage #16 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #17 ====
+User: 
+再补充一个关键实现细节：HTNcut / L_cut / L_bal 中使用的 Pi 请统一成 Pi_cut，不要一会儿用原始 Pi，一会儿用 Pi_sym。
+
+默认做法：
+Pi_cut = (Pi + Pi.T) / 2
+
+然后：
+d_pi = Pi_cut @ ones
+D_pi = diag(d_pi)
+L_cut_base = Tr((S.T @ D_pi @ S + eps I)^(-1) @ S.T @ (D_pi - Pi_cut) @ S)
+
+L_bal 也使用同一个 Pi_cut：
+d_pi = Pi_cut @ ones
+two_m = d_pi.sum()
+
+也就是说，L_cut_base 和 L_bal 必须使用完全一致的 affinity graph 和 degree vector。
+
+原因：
+1. Ncut 本身通常定义在 weighted undirected graph / symmetric affinity matrix 上；
+2. 如果 Pi 是非对称的，D - Pi 不一定是标准对称 Laplacian，trace-form Ncut 的意义会变弱；
+3. spectral(Pi) 诊断里可以同时保留 raw Pi、Pi_sym、topk Pi_sym，但训练主损失默认用 Pi_sym；
+4. 请在日志中输出：
+   - pi_is_symmetric
+   - pi_asymmetry_norm = ||Pi - Pi.T||_F / (||Pi||_F + eps)
+   - pi_cut_nnz
+   - pi_cut_density
+
+kotlin.Unit
+
+==== AgentMessage #18 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #19 ====
+User: 
+请以这条消息作为最终覆盖说明，之前关于 L_bal / Pi / loss_cut 的不一致表述全部以后面这版为准。
+
+一、Pi 的使用方式
+
+训练主损失中不要直接使用 raw Pi，而是统一使用：
+
+Pi_cut = (Pi + Pi.T) / 2
+
+然后所有 cut-main 相关计算都基于 Pi_cut：
+
+d_pi = Pi_cut @ ones
+D_pi = diag(d_pi)
+
+L_cut_base = Tr(
+    (S.T @ D_pi @ S + eps * I)^(-1)
+    @ S.T
+    @ (D_pi - Pi_cut)
+    @ S
+)
+
+L_bal 也必须使用同一个 Pi_cut 和同一个 d_pi：
+
+d_pi = Pi_cut @ ones
+two_m = d_pi.sum()
+
+不要出现：
+- L_cut 用 raw Pi，L_bal 用 Pi_sym；
+- L_cut 用 Pi_sym，L_bal 用 raw Pi；
+- spectral 诊断用 Pi_sym，但训练 loss 用 raw Pi。
+
+训练主目标统一用 Pi_cut。
+诊断脚本里可以额外比较 raw Pi、Pi_sym、topk Pi_sym。
+
+二、loss_cut 的含义
+
+请明确区分：
+
+loss_cut_base = L_cut_base
+loss_bal = L_bal
+
+在代码中，loss_cut 或 loss_htncut 默认只表示 L_cut_base，不要把 L_bal 预先加进去。
+
+也就是说，不要写成：
+
+loss_cut = loss_cut_base + lambda_bal * loss_bal
+loss_total = loss_cut + lambda_bal * loss_bal
+
+这样会重复加 L_bal。
+
+正确写法是：
+
+loss_cut = loss_cut_base
+
+if objective_mode == "cut_main":
+    loss_total = loss_cut \
+               + lambda_temp * loss_temp \
+               + lambda_batch * loss_batch \
+               + lambda_bal * loss_bal
+
+if objective_mode == "original":
+    loss_total = loss_temp \
+               + lambda_cut * loss_cut \
+               + lambda_batch * loss_batch \
+               + lambda_bal * loss_bal
+
+如果原项目里原来写的是：
+L_cut = L_cut_base + lambda_p L_bal
+请改成两个变量分别返回：
+- loss_cut_base
+- loss_bal
+
+三、L_bal 的最终定义
+
+不要使用 rho-based L_bal。也就是说，不要用：
+
+rho = (S.T @ d_pi) / d_pi.sum()
+L_bal = (sqrt(K) * ||rho||_2 - 1) / (sqrt(K) - 1)
+
+请使用 current_plan_tppr_ncut.md 里的 weighted-norm 版本：
+
+给定：
+S ∈ R^{N x K}
+Pi_cut ∈ R^{N x N}
+d_pi = Pi_cut @ ones
+s_j = S[:, j]
+two_m = d_pi.sum()
+
+定义：
+
+L_bal =
+1 / (sqrt(K) - 1 + eps)
+*
+(
+    sqrt(K)
+    -
+    1 / sqrt(two_m + eps)
+    *
+    sum_{j=1}^{K} || s_j * sqrt(d_pi + eps) ||_2
+)
+
+代码形式：
+
+sqrt_k = torch.sqrt(torch.tensor(float(K), device=S.device))
+d_pi = Pi_cut @ torch.ones(Pi_cut.shape[0], device=S.device)
+two_m = d_pi.sum()
+
+weighted_norm_sum = 0.0
+for j in range(K):
+    weighted_norm_sum = weighted_norm_sum + torch.norm(
+        S[:, j] * torch.sqrt(d_pi + eps),
+        p=2
+    )
+
+loss_bal = (
+    sqrt_k - weighted_norm_sum / torch.sqrt(two_m + eps)
+) / (sqrt_k - 1.0 + eps)
+
+四、为什么不用 rho-based 版本
+
+rho-based L_bal 只能约束 cluster volume 是否均匀，但不能惩罚所有节点对所有 cluster 都均匀分配的无信息软塌缩。
+
+例如：
+S_ik = 1 / K
+
+这种情况下 rho 也会接近 [1/K, ..., 1/K]，rho-based L_bal 会接近 0，但这个 assignment 没有任何聚类信息。
+
+weighted-norm 版本可以同时惩罚：
+1. 所有节点塌缩到一个 cluster；
+2. 所有节点对所有 cluster 都均匀软分配。
+
+五、日志必须输出
+
+请在训练日志和 csv 中输出：
+
+loss_cut_base
+loss_bal
+lambda_bal * loss_bal
+loss_temp
+lambda_temp * loss_temp
+loss_batch
+lambda_batch * loss_batch
+loss_total
+
+cluster_mass = S.sum(dim=0)
+cluster_volume = S.T @ d_pi
+cluster_volume_min
+cluster_volume_max
+cluster_volume_entropy
+assignment_entropy = mean entropy of S rows
+
+pi_is_symmetric
+pi_asymmetry_norm = ||Pi - Pi.T||_F / (||Pi||_F + eps)
+pi_cut_nnz
+pi_cut_density
+
+六、评估方式保持不变
+
+cut_main 模式下主结果是：
+
+pred_s = S.argmax(dim=1)
+
+同时保留：
+KMeans(Z)
+KMeans(S)
+spectral(Pi_sym)
+spectral(topk_Pi_sym)
+
+七、请最后检查
+
+请检查项目中是否存在以下错误：
+
+1. L_bal 被加了两次；
+2. L_cut_base 和 L_bal 使用了不同的 Pi；
+3. L_cut_base 使用 raw Pi，但 L_bal 使用 Pi_sym；
+4. cut_main 模式下仍然只报告 KMeans(Z)；
+5. rho-based L_bal 仍然作为默认实现；
+6. 原始 original 模式被删除，导致无法对照。
+
+如果有，请修正。
+
+kotlin.Unit
+
+==== AgentMessage #20 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #21 ====
+User: 
+最后补充两个工程实现细节：
+
+1. 计算 L_cut_base 时，不要显式求 inverse：
+   不要写 torch.inverse(S.T @ D @ S + eps I)
+   尽量用 torch.linalg.solve 或 torch.linalg.cholesky_solve，提高数值稳定性。
+
+2. 如果 Pi 是稀疏矩阵，不要随便 densify 成完整 N x N dense matrix。
+   Pi_cut = (Pi + Pi.T) / 2 也尽量保持 sparse。
+   如果必须 dense，请只在小数据集上做，并在日志里提示内存风险。
+
+3. top-k Pi_sym 之后最好再次对称化：
+   Pi_topk = topk(Pi_sym)
+   Pi_topk_sym = (Pi_topk + Pi_topk.T) / 2
+   spectral(topk Pi) 使用 Pi_topk_sym。
+
+kotlin.Unit
+
+==== AgentMessage #22 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+
+==== UserMessageImpl #23 ====
+User: 
+请修改 run_ablations.py：
+original 模式下不要传入默认 lambda_bal=0.005，而是强制 lambda_bal=0.0，保证 original baseline 是纯原始目标。
+cut_main_* 模式继续使用命令行传入的 lambda_bal。
+
+另外，建议 trainer.py 同时保存 raw Pi 和 Pi_cut：
+- *_pi_raw.npz
+- *_pi_cut.npz
+
+diagnose_pi.py 如果输入 raw Pi，请在输出里明确 spectral 指标是基于内部 symmetrize 后的 Pi_sym；最好额外计算 Pi_sym 的 within/between mass。
+
+kotlin.Unit
+
+==== AgentMessage #24 ====
+Assistant: 
+
+
+Tool use list:
+
+
+kotlin.Unit
+

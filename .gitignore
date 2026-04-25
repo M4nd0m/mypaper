@@ -1,0 +1,68 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Archives and local office files
+*.zip
+*.rar
+*.7z
+*.xlsx
+*.xls
+
+# Logs and runtime artifacts
+*.log
+logs/
+tmp/
+temp/
+
+# HINOS experiment outputs and cached matrices
+HINOS/cache/
+HINOS/emb/
+HINOS/results/
+HINOS/outputs/
+HINOS/runs/
+HINOS/checkpoints/
+
+# HINOS large datasets and pretrained embeddings
+HINOS/dataset/*
+!HINOS/dataset/README*
+HINOS/pretrain/
+
+# Common binary data/model artifacts
+*.emb
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.mat
+*.h5
+*.hdf5
+
+# Generated experiment tables
+*.csv
+*.tsv
+
+# Keep documentation trackable
+!README*
+!docs/**/*.csv
