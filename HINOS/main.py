@@ -47,6 +47,21 @@ def get_args():
     parser.add_argument("--taps_T_cap", type=int, default=10, help="maximum TAPS time step cap; 0 means no cap")
 
     parser.add_argument("--objective_mode", type=str, default="original", choices=["original", "cut_main"])
+    parser.add_argument(
+        "--assign_mode",
+        type=str,
+        default="prototype",
+        choices=["mlp", "prototype"],
+        help="soft assignment head",
+    )
+    parser.add_argument("--prototype_alpha", type=float, default=1.0, help="Student-t assignment alpha")
+    parser.add_argument(
+        "--main_pred_mode",
+        type=str,
+        default="kmeans_z",
+        choices=["kmeans_z", "argmax_s", "kmeans_s", "spectral_pi", "spectral_topk_pi"],
+        help="prediction method exported as the main *_pred.txt file",
+    )
     parser.add_argument("--lambda_com", type=float, default=None, help="community-aware loss weight")
     parser.add_argument(
         "--lambda_community",
@@ -66,7 +81,7 @@ def get_args():
         "--lambda_temp",
         type=float,
         default=None,
-        help="legacy temporal loss weight; not part of the canonical cut_main objective",
+        help="temporal loss weight",
     )
     parser.add_argument("--lambda_batch", type=float, default=None, help="batch reconstruction loss weight")
     parser.add_argument("--lambda_bal", type=float, default=None, help="degree-aware balance penalty weight")
@@ -93,7 +108,7 @@ def apply_objective_defaults(args):
             args.lambda_com = 1.0
         args.lambda_community = args.lambda_com
         if args.lambda_temp is None:
-            args.lambda_temp = 1.0
+            args.lambda_temp = 0.01
         if args.lambda_batch is None:
             args.lambda_batch = 0.01
         if args.lambda_bal is None:
@@ -135,10 +150,11 @@ def main():
         f"tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
     )
     print(
-        f"[Loss] lambda_com={args.lambda_com}, rho_assign={args.rho_assign}, "
-        f"lambda_batch={args.lambda_batch}, legacy_lambda_temp={args.lambda_temp}, "
+        f"[Loss] lambda_temp={args.lambda_temp}, lambda_com={args.lambda_com}, "
+        f"lambda_batch={args.lambda_batch}, rho_assign={args.rho_assign}, "
         f"legacy_lambda_bal={args.lambda_bal}"
     )
+    print(f"[Assign] mode={args.assign_mode}, prototype_alpha={args.prototype_alpha}, main_pred={args.main_pred_mode}")
     print(f"[NCut] hidden_dim={args.cluster_hidden_dim}, spectral_topk={args.spectral_topk}, scope=full")
     print(f"[Cluster] num_clusters   = {args.num_clusters if args.num_clusters > 0 else 'auto-from-labels'}")
     print(f"[Path] data_root         = {args.data_root}")

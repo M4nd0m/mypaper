@@ -7,7 +7,7 @@ The current HINOS offline objective is
 \[
 \mathcal{L}
 =
-\mathcal{L}_{\mathrm{temp}}
+\lambda_{\mathrm{temp}}\mathcal{L}_{\mathrm{temp}}
 +
 \lambda_{\mathrm{com}}\mathcal{L}_{\mathrm{com}}
 +
@@ -17,28 +17,12 @@ The current HINOS offline objective is
 The three terms have separate roles:
 
 - \(\mathcal{L}_{\mathrm{temp}}\): temporal dynamics preservation.
-- \(\mathcal{L}_{\mathrm{com}}\): TPPR-induced community-aware cut regularization.
+- \(\mathcal{L}_{\mathrm{com}}\): TPPR-induced community-aware objective.
 - \(\mathcal{L}_{\mathrm{batch}}\): batch-level local structure reconstruction.
 
-TPPR + Cut is the core advantage of this pipeline and should not be removed or replaced by ordinary adjacency-based clustering losses.
+Temporal loss is not removed. TPPR + Cut is the core advantage of this pipeline and should not be replaced by ordinary adjacency-based clustering losses.
 
-## 2. TPPR-induced temporal affinity
-
-The TPPR-induced temporal-structural similarity matrix is
-
-\[
-\Pi \in \mathbb{R}^{N \times N}.
-\]
-
-Its degree matrix is
-
-\[
-D_{\Pi}=\operatorname{diag}(\Pi\mathbf{1}).
-\]
-
-\(\Pi\) is produced by temporal path sparsification and truncated TPPR. It is not a plain adjacency matrix; it encodes higher-order temporal-structural proximity.
-
-## 3. Community-aware loss
+## 2. TPPR-induced community objective
 
 The community-aware loss is
 
@@ -47,7 +31,7 @@ The community-aware loss is
 =
 \mathcal{L}_{\mathrm{TPPR\text{-}Cut}}
 +
-\rho\mathcal{R}_{\Pi}(S).
+\rho_{\mathrm{assign}}\mathcal{R}_{\Pi}(S).
 \]
 
 The main term is TPPR-induced normalized cut:
@@ -57,57 +41,72 @@ The main term is TPPR-induced normalized cut:
 =
 \operatorname{Tr}
 \left[
-\left(S^{\top}D_{\Pi}S\right)^{-1}
-S^{\top}
-\left(D_{\Pi}-\Pi\right)
-S
+(S^{\top}D_{\Pi}S)^{-1}
+S^{\top}(D_{\Pi}-\Pi)S
 \right].
 \]
 
-This is the core community objective. The assignment penalty only stabilizes the soft assignment matrix.
+\(\Pi\) is the TPPR-induced temporal-structural affinity matrix, not a plain adjacency matrix. It is built from temporal path sparsification and truncated TPPR, then converted into the full-graph cut representation used by the optimizer.
 
-## 4. TPPR-aware assignment penalty
+## 3. Why previous KL failed
 
-The unified assignment penalty is
+The previous KL penalty was not necessarily wrong. The issue was that the relaxed assignment source \(S\) was too weak.
+
+When the soft assignment is close to uniform,
 
 \[
-\mathcal{R}_{\Pi}(S)
-=
-\operatorname{KL}(P_{\Pi}\|S).
+S_{ik}\approx 1/K,
 \]
 
-Expanded:
+the self-target distribution constructed from \(S\) is also close to uniform:
 
 \[
-\mathcal{R}_{\Pi}(S)
+P^{\Pi}_{ik}\approx S_{ik}.
+\]
+
+Therefore
+
+\[
+\operatorname{KL}(P_{\Pi}\|S)\approx 0.
+\]
+
+In that regime, the self-target KL does not actively break uniform soft assignments. The fix is to improve the source of \(S\), while keeping the TPPR-aware KL design.
+
+## 4. Prototype-based assignment
+
+By default, \(S\) is computed with prototype-based Student-t assignment:
+
+\[
+S_{ik}
 =
-\sum_{i=1}^{N}
-\bar{d}_{\Pi,i}
-\sum_{k=1}^{K}
-P^{\Pi}_{ik}
-\log
 \frac{
-P^{\Pi}_{ik}+\epsilon
+(1+\|z_i-c_k\|_2^2/\alpha)^{-(\alpha+1)/2}
 }{
-S_{ik}+\epsilon
+\sum_{\ell=1}^{K}
+(1+\|z_i-c_{\ell}\|_2^2/\alpha)^{-(\alpha+1)/2}
 }.
 \]
+
+Here \(c_k\) is a learnable cluster prototype and \(\alpha\) defaults to 1.0. Prototypes are initialized by KMeans on pretrained node2vec embeddings. The node2vec embeddings only provide the warm start; the final representation is still refined by temporal loss, TPPR-Cut, TPPR-aware KL, and batch reconstruction.
+
+The older MLP head is still available through `--assign_mode mlp` for ablations.
+
+## 5. TPPR-aware KL assignment penalty
 
 The normalized TPPR degree weight is
 
 \[
-\bar{d}_{\Pi,i}
+\bar d_{\Pi,i}
 =
-\frac{d_{\Pi,i}}{\sum_{j=1}^{N}d_{\Pi,j}}.
+\frac{d_{\Pi,i}}{\sum_j d_{\Pi,j}}.
 \]
 
-The soft volume of cluster \(k\) on the TPPR graph is
+The TPPR-weighted soft cluster volume is
 
 \[
 f_k
 =
-\sum_{i=1}^{N}
-\bar{d}_{\Pi,i}S_{ik}.
+\sum_i \bar d_{\Pi,i}S_{ik}.
 \]
 
 The target distribution is
@@ -123,16 +122,31 @@ S_{i\ell}^{2}/(f_{\ell}+\epsilon)
 }.
 \]
 
-This design has one unified penalty:
+The assignment penalty is
 
-- \(S_{ik}^2\) increases assignment confidence.
-- \(f_k\) prevents large clusters from absorbing all nodes.
+\[
+\mathcal{R}_{\Pi}(S)
+=
+\sum_i
+\bar d_{\Pi,i}
+\sum_k
+P^{\Pi}_{ik}
+\log
+\frac{P^{\Pi}_{ik}+\epsilon}{S_{ik}+\epsilon}.
+\]
+
+This remains a single penalty function:
+
+- \(S_{ik}^2\) sharpens high-confidence assignments.
+- \(f_k\) reduces large-cluster bias.
 - \(\bar d_{\Pi,i}\) makes the penalty TPPR-aware.
-- It is one function \(\mathcal{R}_{\Pi}(S)\), not a stack of multiple losses.
+- It is not a stack of BSA, entropy, or balance losses.
 
-## 5. Temporal dynamics loss
+In implementation, \(P^{\Pi}\) is detached before the KL term is evaluated.
 
-The temporal score follows the existing Hawkes-style implementation. For an event \((u,v,t)\),
+## 6. Temporal dynamics loss
+
+The temporal score keeps the existing Hawkes-style structure:
 
 \[
 \mu(u,v,t)=-\|z_u-z_v\|_2^2.
@@ -172,10 +186,10 @@ s(u,v,t)
 \right].
 \]
 
-The implementation uses \(\delta_{+}=\operatorname{softplus}(\delta)\), so the decay is
+The implementation uses positive decay \(\delta_+=\operatorname{softplus}(\delta)\), so historical influence decays as
 
 \[
-\exp(-\delta_{+}(t-t_x))
+\exp(-\delta_+(t-t_x))
 \]
 
 instead of
@@ -184,11 +198,9 @@ instead of
 \exp(\delta(t-t_x)).
 \]
 
-Larger time gaps therefore have smaller historical influence.
+## 7. Batch reconstruction loss
 
-## 6. Batch-level reconstruction loss
-
-The batch reconstruction term preserves local interaction structure inside each mini-batch. It keeps observed source-target and source-history pairs close and pushes sampled negatives away. It supports representation learning but does not carry the core clustering objective.
+The batch reconstruction term preserves local interaction structure inside each mini-batch. It keeps observed source-target and source-history pairs close and pushes sampled negatives away. It supports representation learning but does not replace the TPPR-induced community objective.
 
 Using cosine similarity,
 
@@ -219,72 +231,72 @@ Using cosine similarity,
 
 The code may use equivalent norm-based reductions, but the role is batch-level local structure reconstruction.
 
-## 7. Implementation mapping
+## 8. Implementation mapping
 
-- `HINOS/sparsification.py`: TPPR construction and cut graph inputs via `compute_tppr_cached(...)` and `build_ncut_graph(...)`.
-- `HINOS/trainer.py`: temporal loss, batch reconstruction loss, TPPR-Cut, TPPR-aware assignment penalty, metrics logging, and prediction export.
-- `HINOS/main.py`: hyperparameters and legacy argument aliases.
-- \(\mathcal{L}_{\mathrm{temp}}\): temporal score loss.
-- \(\mathcal{L}_{\mathrm{com}}\): TPPR-Cut + TPPR-aware assignment penalty.
-- \(\mathcal{L}_{\mathrm{batch}}\): batch-level reconstruction.
+- `HINOS/main.py`: CLI arguments for objective weights, assignment mode, prototype alpha, and main prediction export.
+- `HINOS/trainer.py`: prototype assignment, MLP assignment ablation, community loss, temporal loss, batch reconstruction, diagnostics, and prediction export.
+- `HINOS/sparsification.py`: TPPR construction and cut graph construction via `compute_tppr_cached(...)` and `build_ncut_graph(...)`.
+- Pretrained embeddings: initialize both \(Z\) and prototype centers when `--assign_mode prototype`.
 
-## 8. Recommended commands
+## 9. Recommended commands
 
-Run the school dataset:
+40-epoch debug run:
+
+```bash
+python main.py \
+  --dataset school \
+  --objective_mode cut_main \
+  --epoch 40 \
+  --assign_mode prototype \
+  --prototype_alpha 1.0 \
+  --lambda_temp 0.01 \
+  --lambda_com 1.0 \
+  --rho_assign 0.1 \
+  --lambda_batch 0.01 \
+  --warmup_epochs 10 \
+  --eval_interval 5 \
+  --grad_eval_interval 5 \
+  --run_tag proto_kl_debug
+```
+
+100-epoch run:
 
 ```bash
 python main.py \
   --dataset school \
   --objective_mode cut_main \
   --epoch 100 \
+  --assign_mode prototype \
+  --prototype_alpha 1.0 \
+  --lambda_temp 0.01 \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
   --warmup_epochs 20 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --run_tag tppr_cut_dta_v1
+  --run_tag proto_kl_100
 ```
 
-Sweep \(\rho\):
-
-```bash
-for rho in 0.01 0.05 0.1 0.2 0.5
-do
-  python main.py \
-    --dataset school \
-    --objective_mode cut_main \
-    --epoch 100 \
-    --lambda_com 1.0 \
-    --rho_assign ${rho} \
-    --lambda_batch 0.01 \
-    --warmup_epochs 20 \
-    --eval_interval 5 \
-    --grad_eval_interval 5 \
-    --run_tag tppr_cut_dta_rho${rho}
-done
-```
-
-## 9. Expected diagnostics
+## 10. Diagnostics
 
 Track:
 
-- `acc_kmeans_z`
-- `nmi_kmeans_z`
-- `ari_kmeans_z`
-- `acc_argmax_s`
-- `nmi_argmax_s`
-- `ari_argmax_s`
-- `cluster_volume_min`
-- `cluster_volume_max`
-- `assignment_entropy`
+- `loss_temp`
 - `loss_tppr_cut`
 - `loss_assign_penalty`
 - `loss_com`
+- `weighted_temp`
+- `weighted_com`
+- `acc_kmeans_z`
+- `acc_argmax_s`
+- `assignment_entropy`
+- `cluster_volume_min`
+- `cluster_volume_max`
 
 Expected behavior:
 
 - `kmeans_z` should not degrade.
-- `argmax_s` should be more stable than with the old standalone `loss_bal`.
-- `cluster_volume_min` should not stay close to 0 for long.
-- `assignment_entropy` should decrease without collapsing too early.
+- `loss_assign_penalty` should no longer stay near 0.
+- `argmax_s` should be more stable than the MLP-head version.
+- TPPR-Cut remains present and participates in optimization.

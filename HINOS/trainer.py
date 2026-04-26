@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.sparse import save_npz
+from sklearn.cluster import KMeans
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -49,7 +50,10 @@ METRIC_COLUMNS = [
     "weighted_batch",
     "weighted_bal",
     "rho_assign",
+    "lambda_temp",
     "lambda_com",
+    "assign_mode",
+    "prototype_alpha",
     "cluster_mass",
     "cluster_volume",
     "cluster_volume_min",
@@ -94,6 +98,9 @@ class TGCTrainer:
         self.grad_eval_interval = int(args.grad_eval_interval) if int(args.grad_eval_interval) > 0 else self.eval_interval
         self.spectral_topk = int(args.spectral_topk)
         self.seed = int(args.seed)
+        self.assign_mode = args.assign_mode
+        self.prototype_alpha = float(args.prototype_alpha)
+        self.main_pred_mode = args.main_pred_mode
 
         self.file_path = os.path.join(args.data_root, self.dataset_name, f"{self.dataset_name}.txt")
         self.label_path = os.path.join(args.data_root, self.dataset_name, "node2label.txt")
@@ -136,6 +143,10 @@ class TGCTrainer:
             nn.ReLU(),
             nn.Linear(args.cluster_hidden_dim, self.num_clusters),
         ).to(self.device)
+        self.cluster_prototypes = None
+        if self.assign_mode == "prototype":
+            centers = KMeans(n_clusters=self.num_clusters, n_init=10, random_state=self.seed).fit(self.feature).cluster_centers_
+            self.cluster_prototypes = nn.Parameter(torch.from_numpy(centers.astype(np.float32)).float().to(self.device))
 
         self.lambda_com = float(args.lambda_com)
         self.rho_assign = float(args.rho_assign)
@@ -166,7 +177,11 @@ class TGCTrainer:
         self.epochs = int(args.epoch)
         self.num_workers = int(args.num_workers)
 
-        params = list(self.cluster_mlp.parameters()) + [self.node_emb, self.delta]
+        params = [self.node_emb, self.delta]
+        if self.assign_mode == "prototype":
+            params.append(self.cluster_prototypes)
+        else:
+            params.extend(self.cluster_mlp.parameters())
         self.opt = Adam(lr=args.learning_rate, params=params)
 
         self.static_predictions: Dict[str, Optional[np.ndarray]] = {}
@@ -219,7 +234,16 @@ class TGCTrainer:
         self.pi_cut_density = float(self.pi_cut_nnz / total_entries) if total_entries > 0 else 0.0
 
     def _assignment(self) -> torch.Tensor:
+        if self.assign_mode == "prototype":
+            return self._prototype_assignment()
         return F.softmax(self.cluster_mlp(self.node_emb), dim=1)
+
+    def _prototype_assignment(self) -> torch.Tensor:
+        eps = 1e-6
+        alpha = max(self.prototype_alpha, eps)
+        dist = torch.cdist(self.node_emb, self.cluster_prototypes, p=2).pow(2)
+        q = (1.0 + dist / alpha).pow(-(alpha + 1.0) / 2.0)
+        return q / (q.sum(dim=1, keepdim=True) + eps)
 
     def _compute_community_terms(
         self, assign: torch.Tensor
@@ -331,14 +355,14 @@ class TGCTrainer:
         if phase == "warmup":
             weighted_com = torch.zeros_like(l_com)
             weighted_cut = torch.zeros_like(l_tppr_cut)
-            weighted_temp = l_temp
+            weighted_temp = self.lambda_temp * l_temp
             weighted_batch = self.lambda_batch * l_batch
             weighted_assign = torch.zeros_like(l_assign)
             weighted_bal = torch.zeros_like(l_assign)
         else:
             weighted_com = self.lambda_com * l_com
             weighted_cut = self.lambda_com * l_tppr_cut
-            weighted_temp = l_temp
+            weighted_temp = self.lambda_temp * l_temp
             weighted_batch = self.lambda_batch * l_batch
             weighted_assign = self.lambda_com * self.rho_assign * l_assign
             weighted_bal = weighted_assign
@@ -409,7 +433,12 @@ class TGCTrainer:
 
     def _grad_norm(self) -> float:
         total = 0.0
-        for param in [self.node_emb, self.delta, *self.cluster_mlp.parameters()]:
+        params = [self.node_emb, self.delta]
+        if self.assign_mode == "prototype":
+            params.append(self.cluster_prototypes)
+        else:
+            params.extend(self.cluster_mlp.parameters())
+        for param in params:
             if param.grad is None:
                 continue
             total += float(torch.sum(param.grad.detach() ** 2).item())
@@ -497,7 +526,7 @@ class TGCTrainer:
 
         if save_final:
             self._save_predictions(self.final_prediction_paths, predictions)
-            main_pred = predictions["kmeans_z"]
+            main_pred = predictions[self.main_pred_mode]
             save_prediction_file(self.pred_path, main_pred)
             np.save(self.soft_assignment_path, assign)
             self.save_node_embeddings(self.emb_path)
@@ -527,7 +556,10 @@ class TGCTrainer:
             "weighted_batch": epoch_stats["weighted_batch"],
             "weighted_bal": epoch_stats["weighted_bal"],
             "rho_assign": self.rho_assign,
+            "lambda_temp": self.lambda_temp,
             "lambda_com": self.lambda_com,
+            "assign_mode": self.assign_mode,
+            "prototype_alpha": self.prototype_alpha,
             "cluster_mass": epoch_stats["cluster_mass"],
             "cluster_volume": epoch_stats["cluster_volume"],
             "cluster_volume_min": epoch_stats["cluster_volume_min"],
@@ -555,7 +587,7 @@ class TGCTrainer:
             writer = csv.DictWriter(writer_file, fieldnames=METRIC_COLUMNS)
             writer.writerow(metric_row)
 
-        main_method = "kmeans_z"
+        main_method = self.main_pred_mode
         print(
             f"[Eval] epoch={epoch_num} phase={metric_row['phase']} "
             f"loss_total={metric_row['loss_total']:.4f} loss_tppr_cut={metric_row['loss_tppr_cut']:.4f} "
