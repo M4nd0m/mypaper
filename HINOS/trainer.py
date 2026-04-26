@@ -171,6 +171,7 @@ class TGCTrainer:
         self.ncut_graph_csr.sort_indices()
         self.pi_cut_csr = self.ncut_graph_csr
         self._prepare_full_ncut_tensors()
+        self.prior_target = self._build_prior_target()
 
         self.K = int(self.num_clusters)
         self.neg_size = int(args.neg_size)
@@ -235,6 +236,33 @@ class TGCTrainer:
         total_entries = float(self.pi_cut_csr.shape[0] * self.pi_cut_csr.shape[1])
         self.pi_cut_density = float(self.pi_cut_nnz / total_entries) if total_entries > 0 else 0.0
 
+    def _build_prior_target(self) -> torch.Tensor:
+        eps = 1e-6
+        feature = torch.from_numpy(self.feature).float().to(self.device)
+        centers_np = KMeans(
+            n_clusters=self.num_clusters,
+            n_init=10,
+            random_state=self.seed,
+        ).fit(self.feature).cluster_centers_
+        centers = torch.from_numpy(centers_np.astype(np.float32)).float().to(self.device)
+
+        alpha = max(float(self.prototype_alpha), eps)
+        dist = torch.cdist(feature, centers, p=2).pow(2)
+        q0 = (1.0 + dist / alpha).pow(-(alpha + 1.0) / 2.0)
+        q0 = q0 / (q0.sum(dim=1, keepdim=True) + eps)
+
+        degree = self.pi_cut_degree
+        degree_sum = degree.sum()
+        if float(degree_sum.detach().item()) > eps:
+            degree_prob = degree / (degree_sum + eps)
+        else:
+            degree_prob = torch.full_like(degree, 1.0 / max(1, degree.numel()))
+
+        f0 = (degree_prob.unsqueeze(1) * q0).sum(dim=0)
+        p0 = q0.pow(2) / (f0.unsqueeze(0) + eps)
+        p0 = p0 / (p0.sum(dim=1, keepdim=True) + eps)
+        return p0.detach()
+
     def _assignment(self) -> torch.Tensor:
         if self.assign_mode == "prototype":
             return self._prototype_assignment()
@@ -263,10 +291,7 @@ class TGCTrainer:
         else:
             degree_prob = torch.full_like(degree, 1.0 / max(1, degree.numel()))
 
-        f = assign.t().mv(degree_prob)
-        target = assign.pow(2) / (f.unsqueeze(0) + eps)
-        target = target / (target.sum(dim=1, keepdim=True) + eps)
-        target = target.detach()
+        target = self.prior_target
         assign_safe = assign.clamp_min(eps)
         l_assign = degree_prob.unsqueeze(1) * target * torch.log((target + eps) / assign_safe)
         l_assign = l_assign.sum()
@@ -323,6 +348,7 @@ class TGCTrainer:
         h_times: torch.Tensor,
         h_time_mask: torch.Tensor,
         epoch_idx: int,
+        num_batches: int = 1,
     ) -> Dict[str, object]:
         batch = s_nodes.size(0)
 
@@ -371,11 +397,12 @@ class TGCTrainer:
             weighted_assign = torch.zeros_like(l_assign)
             weighted_bal = torch.zeros_like(l_assign)
         else:
-            weighted_com = effective_lambda_com * l_com
-            weighted_cut = effective_lambda_com * l_tppr_cut
+            effective_lambda_com_batch = effective_lambda_com / max(1, num_batches)
+            weighted_com = effective_lambda_com_batch * l_com
+            weighted_cut = effective_lambda_com_batch * l_tppr_cut
             weighted_temp = self.lambda_temp * l_temp
             weighted_batch = self.lambda_batch * l_batch
-            weighted_assign = effective_lambda_com * self.rho_assign * l_assign
+            weighted_assign = effective_lambda_com_batch * self.rho_assign * l_assign
             weighted_bal = weighted_assign
 
         loss_total = weighted_temp + weighted_com + weighted_batch
@@ -415,9 +442,9 @@ class TGCTrainer:
             sample["history_masks"].float().to(self.device),
         )
 
-    def update(self, batch_tensors: Tuple[torch.Tensor, ...], epoch_idx: int) -> Dict[str, float]:
+    def update(self, batch_tensors: Tuple[torch.Tensor, ...], epoch_idx: int, num_batches: int = 1) -> Dict[str, float]:
         self.opt.zero_grad()
-        loss_terms = self.compute_loss_terms(*batch_tensors, epoch_idx)
+        loss_terms = self.compute_loss_terms(*batch_tensors, epoch_idx, num_batches=num_batches)
         loss_terms["loss_total"].backward()
         self.opt.step()
         return {
@@ -457,7 +484,9 @@ class TGCTrainer:
             total += float(torch.sum(param.grad.detach() ** 2).item())
         return math.sqrt(total)
 
-    def compute_gradient_diagnostics(self, probe_batch: Tuple[torch.Tensor, ...], epoch_idx: int) -> Dict[str, float]:
+    def compute_gradient_diagnostics(
+        self, probe_batch: Tuple[torch.Tensor, ...], epoch_idx: int, num_batches: int = 1
+    ) -> Dict[str, float]:
         grad_norms = {"grad_norm_cut": 0.0, "grad_norm_temp": 0.0, "grad_norm_batch": 0.0, "grad_norm_bal": 0.0}
         component_map = {
             "grad_norm_cut": "weighted_cut_base",
@@ -467,7 +496,7 @@ class TGCTrainer:
         }
         for out_name, term_name in component_map.items():
             self.opt.zero_grad()
-            loss_terms = self.compute_loss_terms(*probe_batch, epoch_idx)
+            loss_terms = self.compute_loss_terms(*probe_batch, epoch_idx, num_batches=num_batches)
             term = loss_terms[term_name]
             if float(term.detach().item()) == 0.0:
                 continue
@@ -524,6 +553,7 @@ class TGCTrainer:
         epoch_stats: Dict[str, float],
         probe_batch: Optional[Tuple[torch.Tensor, ...]],
         save_final: bool = False,
+        num_batches: int = 1,
     ) -> Dict[str, object]:
         emb = self.node_emb.detach().cpu().numpy().astype(np.float32)
         assign = self._assignment().detach().cpu().numpy().astype(np.float32)
@@ -587,7 +617,7 @@ class TGCTrainer:
         }
 
         if probe_batch is not None and self.grad_eval_interval > 0 and epoch_num % self.grad_eval_interval == 0:
-            metric_row.update(self.compute_gradient_diagnostics(probe_batch, epoch_num - 1))
+            metric_row.update(self.compute_gradient_diagnostics(probe_batch, epoch_num - 1, num_batches=num_batches))
 
         for method, pred in predictions.items():
             metrics = self._prediction_metrics(pred)
@@ -662,7 +692,7 @@ class TGCTrainer:
                 batch_tensors = self._sample_to_device(sample)
                 if probe_batch is None:
                     probe_batch = tuple(t.detach().clone() for t in batch_tensors)
-                step_stats = self.update(batch_tensors, epoch_idx)
+                step_stats = self.update(batch_tensors, epoch_idx, num_batches=num_batches)
                 for key in epoch_sums:
                     epoch_sums[key] += step_stats[key]
                 final_cluster_mass = step_stats["cluster_mass"]
@@ -706,7 +736,13 @@ class TGCTrainer:
                 self.eval_interval > 0 and (epoch_idx + 1) % self.eval_interval == 0
             )
             if should_eval:
-                last_eval = self.evaluate_and_log(epoch_idx + 1, epoch_avgs, probe_batch, save_final=(epoch_idx + 1 == self.epochs))
+                last_eval = self.evaluate_and_log(
+                    epoch_idx + 1,
+                    epoch_avgs,
+                    probe_batch,
+                    save_final=(epoch_idx + 1 == self.epochs),
+                    num_batches=num_batches,
+                )
 
         total_time = time.time() - total_start
         print(f"Training finished in {total_time:.2f}s ({total_time / 60.0:.2f} min)")

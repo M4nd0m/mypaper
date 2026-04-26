@@ -66,7 +66,7 @@ def get_args():
     parser.add_argument(
         "--main_pred_mode",
         type=str,
-        default="kmeans_z",
+        default=None,
         choices=["kmeans_z", "argmax_s", "kmeans_s", "spectral_pi", "spectral_topk_pi"],
         help="prediction method exported as the main *_pred.txt file",
     )
@@ -132,6 +132,11 @@ def apply_objective_defaults(args):
             args.lambda_batch = 1.0
         if args.lambda_bal is None:
             args.lambda_bal = 0.0
+    if args.main_pred_mode is None:
+        if args.objective_mode == "cut_main":
+            args.main_pred_mode = "argmax_s"
+        else:
+            args.main_pred_mode = "kmeans_z"
     return args
 
 
