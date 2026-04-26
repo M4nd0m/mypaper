@@ -3,7 +3,7 @@
 This project keeps only the offline training pipeline from the original HINOS codebase.
 
 Kept:
-- sqrt(static_edges) TAPS sampling
+- adaptive TAPS sampling
 - TPPR construction and caching
 - reconstruction loss
 - temporal loss
@@ -44,10 +44,53 @@ TPPR + Cut is the core community-aware objective in this project. By default, th
 
 See [docs/loss_function_design.md](docs/loss_function_design.md) for the full design and implementation mapping.
 
+## TAPS Budget
+
+`--taps_budget_mode sqrt_edges` keeps the original compatibility behavior:
+
+\[
+N_{\mathrm{TAPS}}=\lceil\sqrt{|\mathcal{E}_{\mathrm{static}}|}\rceil .
+\]
+
+For full-graph TPPR-Cut clustering, the recommended mode is `nlogn`:
+
+\[
+N_{\mathrm{TAPS}}
+=
+\left\lceil
+\beta |\mathcal{V}|\log(|\mathcal{V}|+1)
+\right\rceil ,
+\]
+
+where \(\beta\) is `--taps_budget_beta`. This is graph-adaptive, not a fixed sample count, and better matches the \(O(n\log n)\) scale commonly used for cut/spectral structure preservation. For School, `--taps_budget_beta 0.5` gives about 947 sampled paths before ceiling, with `computed_N_TAPS=948`.
+
 Run one dataset:
 
 ```bash
 python main.py --dataset school --epoch 30 --lambda_community 0.1
+```
+
+Recommended School TPPR-Cut run:
+
+```bash
+python main.py \
+  --dataset school \
+  --objective_mode cut_main \
+  --epoch 40 \
+  --assign_mode prototype \
+  --prototype_alpha 1.0 \
+  --lambda_temp 0.01 \
+  --lambda_com 1.0 \
+  --rho_assign 0.1 \
+  --lambda_batch 0.01 \
+  --warmup_epochs 10 \
+  --com_ramp_epochs 20 \
+  --taps_budget_mode nlogn \
+  --taps_budget_beta 0.5 \
+  --eval_interval 5 \
+  --grad_eval_interval 5 \
+  --main_pred_mode kmeans_z \
+  --run_tag proto_kl_ramp_taps_nlogn_b05
 ```
 
 If `node2label.txt` is unavailable or you do not want to rely on it for inferring the cluster count, pass `--num_clusters` explicitly:

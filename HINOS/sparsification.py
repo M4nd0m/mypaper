@@ -29,6 +29,32 @@ def sqrt_static_edge_budget(static_edges: int) -> int:
     return max(1, int(math.ceil(math.sqrt(float(static_edges)))))
 
 
+def count_temporal_nodes(tadj_list: Dict[int, Dict[int, set]]) -> int:
+    all_nodes = set(tadj_list.keys())
+    for u in tadj_list:
+        all_nodes.update(tadj_list[u].keys())
+    return (max(all_nodes) + 1) if all_nodes else 0
+
+
+def taps_budget(args, tadj_list: Dict[int, Dict[int, set]]) -> Tuple[int, int, int]:
+    static_edges = count_static_edges(tadj_list)
+    num_nodes = count_temporal_nodes(tadj_list)
+    mode = getattr(args, "taps_budget_mode", "sqrt_edges")
+    beta = float(getattr(args, "taps_budget_beta", 1.0))
+    if beta < 0:
+        raise ValueError("--taps_budget_beta must be non-negative.")
+    if mode == "sqrt_edges":
+        taps_N = sqrt_static_edge_budget(static_edges)
+    elif mode == "nlogn":
+        # For full-graph TPPR-Cut, the affinity enters normalized cut. An
+        # n log n path budget better tracks spectral sparsification scale than
+        # the efficiency-first sqrt(static_edges) community-search budget.
+        taps_N = int(math.ceil(beta * float(num_nodes) * math.log(float(num_nodes) + 1.0))) if num_nodes > 0 else 0
+    else:
+        raise ValueError(f"Unsupported taps_budget_mode: {mode}")
+    return int(taps_N), int(static_edges), int(num_nodes)
+
+
 def build_B(edges: List[EdgePair], num_nodes: int) -> csr_matrix:
     m = len(edges)
     if m == 0:
@@ -113,6 +139,7 @@ class TimeAwarePathSparsifier:
         tau_eps: float,
         rng_seed: int,
         T_cap: Optional[int],
+        N: int,
     ):
         self.tadj = tadj_list
         self.T = int(T)
@@ -121,6 +148,7 @@ class TimeAwarePathSparsifier:
         self.alpha = float(alpha)
         self.tau_eps = float(tau_eps)
         self.rng = np.random.RandomState(rng_seed)
+        self.N = int(N)
 
         self.edges_static = []
         seen = set()
@@ -131,12 +159,8 @@ class TimeAwarePathSparsifier:
                     seen.add((a, b))
                     self.edges_static.append((a, b))
         self.m = len(self.edges_static)
-        self.N = sqrt_static_edge_budget(self.m)
 
-        all_nodes = set(self.tadj.keys())
-        for u in self.tadj:
-            all_nodes.update(self.tadj[u].keys())
-        self.num_nodes = (max(all_nodes) + 1) if all_nodes else 0
+        self.num_nodes = count_temporal_nodes(self.tadj)
 
         if self.T > 0:
             rs = np.arange(1, self.T + 1, dtype=float)
@@ -243,13 +267,18 @@ class TimeAwarePathSparsifier:
 
 
 def taps_cache_config(args, tadj_list):
-    static_edges = count_static_edges(tadj_list)
-    taps_N = sqrt_static_edge_budget(static_edges)
+    taps_N, static_edges, num_nodes = taps_budget(args, tadj_list)
+    budget_mode = getattr(args, "taps_budget_mode", "sqrt_edges")
+    budget_beta = float(getattr(args, "taps_budget_beta", 1.0))
     return {
         "alpha": float(args.taps_alpha),
-        "N_mode": "sqrt_static_edges",
+        "N_mode": str(budget_mode),
+        "taps_budget_mode": str(budget_mode),
+        "taps_budget_beta": float(budget_beta),
         "N": int(taps_N),
+        "computed_N_TAPS": int(taps_N),
         "static_edges": int(static_edges),
+        "num_nodes": int(num_nodes),
         "tau_eps": float(args.taps_tau_eps),
         "rng": int(args.taps_rng_seed),
         "Tcap": int(args.taps_T_cap) if int(args.taps_T_cap) > 0 else -1,
@@ -262,7 +291,8 @@ def compute_taps_cached(file_path: str, args, dataset: str, tadj_list=None, T_to
         tadj_list, T_total = compress_time_indices(edges_uvt)
 
     tppr_cfg = {"tppr_alpha": float(args.tppr_alpha), "tppr_K": int(args.tppr_K)}
-    taps_path, _ = cache_paths(args.cache_dir, dataset, tppr_cfg, taps_cache_config(args, tadj_list))
+    taps_cfg = taps_cache_config(args, tadj_list)
+    taps_path, _ = cache_paths(args.cache_dir, dataset, tppr_cfg, taps_cfg)
     if os.path.exists(taps_path):
         return load_npz(taps_path).tocsr()
 
@@ -273,6 +303,7 @@ def compute_taps_cached(file_path: str, args, dataset: str, tadj_list=None, T_to
         tau_eps=args.taps_tau_eps,
         rng_seed=args.taps_rng_seed,
         T_cap=args.taps_T_cap,
+        N=taps_cfg["computed_N_TAPS"],
     ).construct_sparsifier()
     save_npz(taps_path, A_time)
     return A_time.tocsr()

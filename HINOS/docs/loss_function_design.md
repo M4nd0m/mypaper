@@ -231,14 +231,52 @@ Using cosine similarity,
 
 The code may use equivalent norm-based reductions, but the role is batch-level local structure reconstruction.
 
-## 8. Implementation mapping
+## 8. TAPS Budget for TPPR-Cut
+
+For full-graph temporal graph clustering, the TAPS/TPPR affinity is not only a sparse approximation artifact. It enters the normalized cut objective through \(\Pi\), so the sampled temporal path graph should preserve cut and spectral structure.
+
+The recommended adaptive budget is
+
+\[
+N_{\mathrm{TAPS}}
+=
+\left\lceil
+\beta |\mathcal{V}|\log(|\mathcal{V}|+1)
+\right\rceil .
+\]
+
+Here \(\beta\) is `--taps_budget_beta`. The budget grows with the number of nodes and is not a fixed sample constant. This is closer to the scale used by cut/spectral sparsification, typically \(O(n\log n)\) or \(O(n\log n/\epsilon^2)\), than a fixed budget.
+
+The legacy `sqrt_edges` mode remains available:
+
+\[
+N_{\mathrm{TAPS}}=\left\lceil \sqrt{|\mathcal{E}_{\mathrm{static}}|}\right\rceil .
+\]
+
+This is an efficiency-first, strongly compressed budget that is suitable for sparse approximation or community search settings. It is not the recommended mode for the current full-graph clustering objective, where TPPR affinity is consumed by normalized cut.
+
+For School, \(|\mathcal{V}|\approx 327\). With `--taps_budget_mode nlogn --taps_budget_beta 0.5`,
+
+\[
+N_{\mathrm{TAPS}}
+\approx
+\left\lceil 0.5 \times 327 \times \log(328) \right\rceil
+=
+948 .
+\]
+
+The unrounded scale is about 947 sampled paths before the final ceiling.
+
+The cache key includes `taps_budget_mode`, `taps_budget_beta`, and the computed `N_TAPS`, so changing the budget mode or scale creates a separate TAPS/TPPR cache file.
+
+## 9. Implementation mapping
 
 - `HINOS/main.py`: CLI arguments for objective weights, assignment mode, prototype alpha, and main prediction export.
-- `HINOS/trainer.py`: prototype assignment, MLP assignment ablation, community loss, temporal loss, batch reconstruction, diagnostics, and prediction export.
-- `HINOS/sparsification.py`: TPPR construction and cut graph construction via `compute_tppr_cached(...)` and `build_ncut_graph(...)`.
+- `HINOS/trainer.py`: prototype assignment, MLP assignment ablation, community loss ramp-up, temporal loss, batch reconstruction, diagnostics, and prediction export.
+- `HINOS/sparsification.py`: adaptive TAPS budget selection, TPPR construction, and cut graph construction via `compute_tppr_cached(...)` and `build_ncut_graph(...)`.
 - Pretrained embeddings: initialize both \(Z\) and prototype centers when `--assign_mode prototype`.
 
-## 9. Recommended commands
+## 10. Recommended commands
 
 40-epoch debug run:
 
@@ -254,9 +292,13 @@ python main.py \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
   --warmup_epochs 10 \
+  --com_ramp_epochs 20 \
+  --taps_budget_mode nlogn \
+  --taps_budget_beta 0.5 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --run_tag proto_kl_debug
+  --main_pred_mode kmeans_z \
+  --run_tag proto_kl_ramp_taps_nlogn_b05
 ```
 
 100-epoch run:
@@ -273,12 +315,16 @@ python main.py \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
   --warmup_epochs 20 \
+  --com_ramp_epochs 20 \
+  --taps_budget_mode nlogn \
+  --taps_budget_beta 0.5 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --run_tag proto_kl_100
+  --main_pred_mode kmeans_z \
+  --run_tag proto_kl_100_taps_nlogn_b05
 ```
 
-## 10. Diagnostics
+## 11. Diagnostics
 
 Track:
 
@@ -288,6 +334,7 @@ Track:
 - `loss_com`
 - `weighted_temp`
 - `weighted_com`
+- `effective_lambda_com`
 - `acc_kmeans_z`
 - `acc_argmax_s`
 - `assignment_entropy`

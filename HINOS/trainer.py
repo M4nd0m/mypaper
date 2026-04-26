@@ -52,6 +52,7 @@ METRIC_COLUMNS = [
     "rho_assign",
     "lambda_temp",
     "lambda_com",
+    "effective_lambda_com",
     "assign_mode",
     "prototype_alpha",
     "cluster_mass",
@@ -154,6 +155,7 @@ class TGCTrainer:
         self.lambda_temp = float(args.lambda_temp)
         self.lambda_batch = float(args.lambda_batch)
         self.lambda_bal = float(args.lambda_bal)
+        self.com_ramp_epochs = int(args.com_ramp_epochs)
 
         self.tppr_mat = compute_tppr_cached(
             self.file_path,
@@ -303,6 +305,14 @@ class TGCTrainer:
             return "warmup"
         return self.objective_mode
 
+    def _effective_lambda_com(self, epoch_idx: int) -> float:
+        if self.objective_mode != "cut_main":
+            return self.lambda_com
+        if epoch_idx < self.warmup_epochs:
+            return 0.0
+        progress = float(epoch_idx + 1 - self.warmup_epochs) / float(max(1, self.com_ramp_epochs))
+        return self.lambda_com * min(1.0, max(0.0, progress))
+
     def compute_loss_terms(
         self,
         s_nodes: torch.Tensor,
@@ -352,6 +362,7 @@ class TGCTrainer:
         l_tppr_cut, l_assign, l_com, com_stats = self._compute_community_terms(assign)
 
         phase = self._loss_phase(epoch_idx)
+        effective_lambda_com = self._effective_lambda_com(epoch_idx)
         if phase == "warmup":
             weighted_com = torch.zeros_like(l_com)
             weighted_cut = torch.zeros_like(l_tppr_cut)
@@ -360,16 +371,17 @@ class TGCTrainer:
             weighted_assign = torch.zeros_like(l_assign)
             weighted_bal = torch.zeros_like(l_assign)
         else:
-            weighted_com = self.lambda_com * l_com
-            weighted_cut = self.lambda_com * l_tppr_cut
+            weighted_com = effective_lambda_com * l_com
+            weighted_cut = effective_lambda_com * l_tppr_cut
             weighted_temp = self.lambda_temp * l_temp
             weighted_batch = self.lambda_batch * l_batch
-            weighted_assign = self.lambda_com * self.rho_assign * l_assign
+            weighted_assign = effective_lambda_com * self.rho_assign * l_assign
             weighted_bal = weighted_assign
 
         loss_total = weighted_temp + weighted_com + weighted_batch
         return {
             "phase": phase,
+            "effective_lambda_com": effective_lambda_com,
             "loss_total": loss_total,
             "loss_tppr_cut": l_tppr_cut,
             "loss_assign_penalty": l_assign,
@@ -417,6 +429,7 @@ class TGCTrainer:
             "loss_temp": float(loss_terms["loss_temp"].item()),
             "loss_batch": float(loss_terms["loss_batch"].item()),
             "loss_bal": float(loss_terms["loss_bal"].item()),
+            "effective_lambda_com": float(loss_terms["effective_lambda_com"]),
             "weighted_com": float(loss_terms["weighted_com"].item()),
             "weighted_assign_penalty": float(loss_terms["weighted_assign_penalty"].item()),
             "weighted_cut_base": float(loss_terms["weighted_cut_base"].item()),
@@ -558,6 +571,7 @@ class TGCTrainer:
             "rho_assign": self.rho_assign,
             "lambda_temp": self.lambda_temp,
             "lambda_com": self.lambda_com,
+            "effective_lambda_com": epoch_stats["effective_lambda_com"],
             "assign_mode": self.assign_mode,
             "prototype_alpha": self.prototype_alpha,
             "cluster_mass": epoch_stats["cluster_mass"],
@@ -594,6 +608,7 @@ class TGCTrainer:
             f"loss_com={metric_row['loss_com']:.4f} "
             f"loss_temp={metric_row['loss_temp']:.4f} loss_batch={metric_row['loss_batch']:.4f} "
             f"loss_assign_penalty={metric_row['loss_assign_penalty']:.4f} "
+            f"effective_lambda_com={metric_row['effective_lambda_com']:.4f} "
             f"weighted_com={metric_row['weighted_com']:.4f} "
             f"cluster_volume_min={metric_row['cluster_volume_min']:.4f} "
             f"cluster_volume_max={metric_row['cluster_volume_max']:.4f} "
@@ -628,6 +643,7 @@ class TGCTrainer:
                 "loss_temp": 0.0,
                 "loss_batch": 0.0,
                 "loss_bal": 0.0,
+                "effective_lambda_com": 0.0,
                 "weighted_com": 0.0,
                 "weighted_assign_penalty": 0.0,
                 "weighted_cut_base": 0.0,
@@ -673,6 +689,7 @@ class TGCTrainer:
             print(
                 f"Epoch {epoch_idx + 1}/{self.epochs} finished in {epoch_time:.2f}s | "
                 f"phase={self._loss_phase(epoch_idx)} "
+                f"effective_lambda_com={epoch_avgs['effective_lambda_com']:.4f} "
                 f"pi_asymmetry_norm={self.pi_asymmetry_norm:.4e} "
                 f"pi_cut_density={self.pi_cut_density:.4e} "
                 f"loss_total={epoch_avgs['loss_total']:.4f} "

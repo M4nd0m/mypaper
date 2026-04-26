@@ -9,7 +9,7 @@ def get_args():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(
-        description="Offline temporal community representation learning with sqrt-TAPS, TPPR, and full-graph NCut."
+        description="Offline temporal community representation learning with adaptive TAPS, TPPR, and full-graph NCut."
     )
     parser.add_argument("-d", "--dataset", type=str, default="school", help="dataset name")
     parser.add_argument("--directed", type=int, default=0, help="whether to read the graph as directed")
@@ -45,6 +45,14 @@ def get_args():
     parser.add_argument("--taps_tau_eps", type=float, default=1.0, help="TAPS temporal smoothing tau_eps")
     parser.add_argument("--taps_rng_seed", type=int, default=42, help="TAPS RNG seed")
     parser.add_argument("--taps_T_cap", type=int, default=10, help="maximum TAPS time step cap; 0 means no cap")
+    parser.add_argument(
+        "--taps_budget_mode",
+        type=str,
+        default="sqrt_edges",
+        choices=["sqrt_edges", "nlogn"],
+        help="TAPS sampling budget: sqrt(static_edges) for compatibility or beta*n*log(n+1)",
+    )
+    parser.add_argument("--taps_budget_beta", type=float, default=1.0, help="dimensionless TAPS nlogn budget scale")
 
     parser.add_argument("--objective_mode", type=str, default="original", choices=["original", "cut_main"])
     parser.add_argument(
@@ -88,6 +96,7 @@ def get_args():
     parser.add_argument("--lambda_ncut_orth", type=float, default=None, help="legacy alias for balance weight")
     parser.add_argument("--cluster_hidden_dim", type=int, default=64, help="cluster MLP hidden dimension")
     parser.add_argument("--warmup_epochs", type=int, default=0, help="warmup epochs before cut_main")
+    parser.add_argument("--com_ramp_epochs", type=int, default=20, help="epochs used to ramp lambda_com after warmup")
     parser.add_argument("--eval_interval", type=int, default=0, help="evaluation interval; 0 means final epoch only")
     parser.add_argument("--grad_eval_interval", type=int, default=0, help="gradient diagnostic interval; 0 follows eval_interval")
     parser.add_argument("--spectral_topk", type=int, default=20, help="top-k sparsification for spectral Pi diagnostics")
@@ -141,13 +150,14 @@ def main():
     print(f"[RUN] dataset            = {args.dataset}")
     print(f"[RUN] objective_mode     = {args.objective_mode}")
     print(f"[RUN] warmup_epochs      = {args.warmup_epochs}")
+    print(f"[RUN] com_ramp_epochs    = {args.com_ramp_epochs}")
     print(f"[RUN] eval_interval      = {args.eval_interval if args.eval_interval > 0 else 'final-only'}")
     print(f"[Graph] directed         = {bool(args.directed)}")
     print(f"[Device] device          = {args.device}")
     print(f"[TPPR] alpha={args.tppr_alpha}, K={args.tppr_K}")
     print(
-        f"[TAPS] alpha={args.taps_alpha}, N=sqrt(static_edges), "
-        f"tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
+        f"[TAPS] alpha={args.taps_alpha}, budget_mode={args.taps_budget_mode}, "
+        f"budget_beta={args.taps_budget_beta}, tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
     )
     print(
         f"[Loss] lambda_temp={args.lambda_temp}, lambda_com={args.lambda_com}, "
