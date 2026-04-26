@@ -18,6 +18,24 @@ Removed:
 - search-specific scoring arguments
 - F1-based early stopping
 
+## Current Loss Function
+
+The current formal objective is:
+
+\[
+\mathcal{L}
+=
+\mathcal{L}_{\mathrm{temp}}
++
+\lambda_{\mathrm{com}}\mathcal{L}_{\mathrm{com}}
++
+\lambda_{\mathrm{batch}}\mathcal{L}_{\mathrm{batch}}.
+\]
+
+Here \(\mathcal{L}_{\mathrm{com}}\) is TPPR-Cut plus one TPPR-aware assignment penalty. TPPR + Cut is the core community-aware objective in this project.
+
+See [docs/loss_function_design.md](docs/loss_function_design.md) for the full design and implementation mapping.
+
 Run one dataset:
 
 ```bash

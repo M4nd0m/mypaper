@@ -47,8 +47,27 @@ def get_args():
     parser.add_argument("--taps_T_cap", type=int, default=10, help="maximum TAPS time step cap; 0 means no cap")
 
     parser.add_argument("--objective_mode", type=str, default="original", choices=["original", "cut_main"])
-    parser.add_argument("--lambda_community", "--lambda_cut", dest="lambda_community", type=float, default=None, help="cut loss weight in original mode")
-    parser.add_argument("--lambda_temp", type=float, default=None, help="temporal loss weight in cut_main mode")
+    parser.add_argument("--lambda_com", type=float, default=None, help="community-aware loss weight")
+    parser.add_argument(
+        "--lambda_community",
+        "--lambda_cut",
+        dest="lambda_community",
+        type=float,
+        default=None,
+        help="legacy alias for --lambda_com",
+    )
+    parser.add_argument(
+        "--rho_assign",
+        type=float,
+        default=0.1,
+        help="TPPR-aware assignment penalty weight inside L_com",
+    )
+    parser.add_argument(
+        "--lambda_temp",
+        type=float,
+        default=None,
+        help="legacy temporal loss weight; not part of the canonical cut_main objective",
+    )
     parser.add_argument("--lambda_batch", type=float, default=None, help="batch reconstruction loss weight")
     parser.add_argument("--lambda_bal", type=float, default=None, help="degree-aware balance penalty weight")
     parser.add_argument("--lambda_ncut_orth", type=float, default=None, help="legacy alias for balance weight")
@@ -64,19 +83,25 @@ def get_args():
 def apply_objective_defaults(args):
     if args.lambda_bal is None and args.lambda_ncut_orth is not None:
         args.lambda_bal = args.lambda_ncut_orth
+    if args.lambda_com is None and args.lambda_community is not None:
+        args.lambda_com = args.lambda_community
+    if args.lambda_community is None and args.lambda_com is not None:
+        args.lambda_community = args.lambda_com
 
     if args.objective_mode == "cut_main":
-        if args.lambda_community is None:
-            args.lambda_community = 1.0
+        if args.lambda_com is None:
+            args.lambda_com = 1.0
+        args.lambda_community = args.lambda_com
         if args.lambda_temp is None:
-            args.lambda_temp = 0.01
+            args.lambda_temp = 1.0
         if args.lambda_batch is None:
             args.lambda_batch = 0.01
         if args.lambda_bal is None:
-            args.lambda_bal = 0.005
+            args.lambda_bal = 0.0
     else:
-        if args.lambda_community is None:
-            args.lambda_community = 0.1
+        if args.lambda_com is None:
+            args.lambda_com = 0.1
+        args.lambda_community = args.lambda_com
         if args.lambda_temp is None:
             args.lambda_temp = 1.0
         if args.lambda_batch is None:
@@ -110,8 +135,9 @@ def main():
         f"tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
     )
     print(
-        f"[Loss] lambda_cut={args.lambda_community}, lambda_temp={args.lambda_temp}, "
-        f"lambda_batch={args.lambda_batch}, lambda_bal={args.lambda_bal}"
+        f"[Loss] lambda_com={args.lambda_com}, rho_assign={args.rho_assign}, "
+        f"lambda_batch={args.lambda_batch}, legacy_lambda_temp={args.lambda_temp}, "
+        f"legacy_lambda_bal={args.lambda_bal}"
     )
     print(f"[NCut] hidden_dim={args.cluster_hidden_dim}, spectral_topk={args.spectral_topk}, scope=full")
     print(f"[Cluster] num_clusters   = {args.num_clusters if args.num_clusters > 0 else 'auto-from-labels'}")

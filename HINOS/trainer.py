@@ -35,14 +35,21 @@ METRIC_COLUMNS = [
     "pi_cut_nnz",
     "pi_cut_density",
     "loss_total",
+    "loss_tppr_cut",
+    "loss_assign_penalty",
+    "loss_com",
     "loss_cut_base",
     "loss_temp",
     "loss_batch",
     "loss_bal",
+    "weighted_com",
+    "weighted_assign_penalty",
     "weighted_cut_base",
     "weighted_temp",
     "weighted_batch",
     "weighted_bal",
+    "rho_assign",
+    "lambda_com",
     "cluster_mass",
     "cluster_volume",
     "cluster_volume_min",
@@ -130,7 +137,9 @@ class TGCTrainer:
             nn.Linear(args.cluster_hidden_dim, self.num_clusters),
         ).to(self.device)
 
-        self.lambda_cut = float(args.lambda_community)
+        self.lambda_com = float(args.lambda_com)
+        self.rho_assign = float(args.rho_assign)
+        self.lambda_cut = self.lambda_com
         self.lambda_temp = float(args.lambda_temp)
         self.lambda_batch = float(args.lambda_batch)
         self.lambda_bal = float(args.lambda_bal)
@@ -212,17 +221,34 @@ class TGCTrainer:
     def _assignment(self) -> torch.Tensor:
         return F.softmax(self.cluster_mlp(self.node_emb), dim=1)
 
-    def _cut_and_balance_terms(self, assign: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
+    def _compute_community_terms(
+        self, assign: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
         eps = 1e-6
-        sqrt_k = torch.sqrt(torch.tensor(float(self.K), device=self.device))
         cluster_mass = assign.sum(dim=0)
         cluster_volume = assign.t().mm(self.pi_cut_degree.unsqueeze(1)).squeeze(1)
         volume_prob = cluster_volume / (cluster_volume.sum() + eps)
         assignment_entropy = -(assign * torch.log(assign + eps)).sum(dim=1).mean()
 
+        degree = self.pi_cut_degree
+        degree_sum = degree.sum()
+        if float(degree_sum.detach().item()) > eps:
+            degree_prob = degree / (degree_sum + eps)
+        else:
+            degree_prob = torch.full_like(degree, 1.0 / max(1, degree.numel()))
+
+        f = assign.t().mv(degree_prob)
+        target = assign.pow(2) / (f.unsqueeze(0) + eps)
+        target = target / (target.sum(dim=1, keepdim=True) + eps)
+        target = target.detach()
+        assign_safe = assign.clamp_min(eps)
+        l_assign = degree_prob.unsqueeze(1) * target * torch.log((target + eps) / assign_safe)
+        l_assign = l_assign.sum()
+
         if self.full_ncut_edge_i.numel() == 0:
             zero = torch.tensor(0.0, device=self.device)
-            return zero, zero, {
+            l_com = zero + self.rho_assign * l_assign
+            return zero, l_assign.squeeze(), l_com.squeeze(), {
                 "cluster_mass": cluster_mass.detach().cpu().numpy(),
                 "cluster_volume": cluster_volume.detach().cpu().numpy(),
                 "cluster_volume_min": float(cluster_volume.min().item()),
@@ -235,16 +261,10 @@ class TGCTrainer:
         l_mat = delta.t().mm(self.full_ncut_edge_w.unsqueeze(1) * delta)
         g_mat = assign.t().mm(self.full_ncut_degree.unsqueeze(1) * assign)
         g_eps = g_mat + eps * torch.eye(self.K, device=self.device)
-        l_cut = torch.trace(torch.linalg.solve(g_eps, l_mat)) / (float(self.K) + 1e-12)
+        l_tppr_cut = torch.trace(torch.linalg.solve(g_eps, l_mat))
+        l_com = l_tppr_cut + self.rho_assign * l_assign
 
-        weighted_norm_sum = torch.tensor(0.0, device=self.device)
-        sqrt_d_pi = torch.sqrt(self.pi_cut_degree + eps)
-        two_m = self.pi_cut_degree.sum()
-        for j in range(self.K):
-            weighted_norm_sum = weighted_norm_sum + torch.norm(assign[:, j] * sqrt_d_pi, p=2)
-        l_bal = (sqrt_k - weighted_norm_sum / torch.sqrt(two_m + eps)) / (sqrt_k - 1.0 + eps)
-
-        bal_stats = {
+        com_stats = {
             "cluster_mass": cluster_mass.detach().cpu().numpy(),
             "cluster_volume": cluster_volume.detach().cpu().numpy(),
             "cluster_volume_min": float(cluster_volume.min().item()),
@@ -252,7 +272,7 @@ class TGCTrainer:
             "cluster_volume_entropy": float((-(volume_prob * torch.log(volume_prob + eps)).sum()).item()),
             "assignment_entropy": float(assignment_entropy.item()),
         }
-        return l_cut.squeeze(), l_bal.squeeze(), bal_stats
+        return l_tppr_cut.squeeze(), l_assign.squeeze(), l_com.squeeze(), com_stats
 
     def _loss_phase(self, epoch_idx: int) -> str:
         if self.objective_mode == "cut_main" and epoch_idx < self.warmup_epochs:
@@ -292,55 +312,60 @@ class TGCTrainer:
         p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
         p_alpha = ((h_node_emb - t_node_emb.unsqueeze(1)) ** 2).sum(dim=2).neg()
         delta = self.delta.index_select(0, s_nodes.view(-1)).unsqueeze(1)
+        delta_pos = F.softplus(delta)
         d_time = torch.abs(t_times.unsqueeze(1) - h_times)
-        p_lambda = p_mu + (att * p_alpha * torch.exp(delta * d_time) * h_time_mask).sum(dim=1)
+        p_lambda = p_mu + (att * p_alpha * torch.exp(-delta_pos * d_time) * h_time_mask).sum(dim=1)
 
         n_mu = ((s_node_emb.unsqueeze(1) - n_node_emb) ** 2).sum(dim=2).neg()
         n_alpha = ((h_node_emb.unsqueeze(2) - n_node_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
-        time_decay = torch.exp(delta * d_time).unsqueeze(2)
+        time_decay = torch.exp(-delta_pos * d_time).unsqueeze(2)
         n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * time_decay * h_time_mask.unsqueeze(2)).sum(dim=1)
 
         loss_pair = -torch.log(p_lambda.sigmoid() + 1e-6) - torch.log(n_lambda.neg().sigmoid() + 1e-6).sum(dim=1)
         l_temp = loss_pair.mean()
 
         assign = self._assignment()
-        l_cut, l_bal, bal_stats = self._cut_and_balance_terms(assign)
+        l_tppr_cut, l_assign, l_com, com_stats = self._compute_community_terms(assign)
 
         phase = self._loss_phase(epoch_idx)
         if phase == "warmup":
-            weighted_cut = torch.zeros_like(l_cut)
+            weighted_com = torch.zeros_like(l_com)
+            weighted_cut = torch.zeros_like(l_tppr_cut)
             weighted_temp = l_temp
             weighted_batch = self.lambda_batch * l_batch
-            weighted_bal = torch.zeros_like(l_bal)
-        elif phase == "cut_main":
-            weighted_cut = l_cut
-            weighted_temp = self.lambda_temp * l_temp
-            weighted_batch = self.lambda_batch * l_batch
-            weighted_bal = self.lambda_bal * l_bal
+            weighted_assign = torch.zeros_like(l_assign)
+            weighted_bal = torch.zeros_like(l_assign)
         else:
-            weighted_cut = self.lambda_cut * l_cut
+            weighted_com = self.lambda_com * l_com
+            weighted_cut = self.lambda_com * l_tppr_cut
             weighted_temp = l_temp
             weighted_batch = self.lambda_batch * l_batch
-            weighted_bal = self.lambda_bal * l_bal
+            weighted_assign = self.lambda_com * self.rho_assign * l_assign
+            weighted_bal = weighted_assign
 
-        loss_total = weighted_cut + weighted_temp + weighted_batch + weighted_bal
+        loss_total = weighted_temp + weighted_com + weighted_batch
         return {
             "phase": phase,
             "loss_total": loss_total,
-            "loss_cut_base": l_cut,
+            "loss_tppr_cut": l_tppr_cut,
+            "loss_assign_penalty": l_assign,
+            "loss_com": l_com,
+            "loss_cut_base": l_tppr_cut,
             "loss_temp": l_temp,
             "loss_batch": l_batch,
-            "loss_bal": l_bal,
+            "loss_bal": l_assign,
+            "weighted_com": weighted_com,
+            "weighted_assign_penalty": weighted_assign,
             "weighted_cut_base": weighted_cut,
             "weighted_temp": weighted_temp,
             "weighted_batch": weighted_batch,
             "weighted_bal": weighted_bal,
-            "cluster_mass": bal_stats["cluster_mass"],
-            "cluster_volume": bal_stats["cluster_volume"],
-            "cluster_volume_min": bal_stats["cluster_volume_min"],
-            "cluster_volume_max": bal_stats["cluster_volume_max"],
-            "cluster_volume_entropy": bal_stats["cluster_volume_entropy"],
-            "assignment_entropy": bal_stats["assignment_entropy"],
+            "cluster_mass": com_stats["cluster_mass"],
+            "cluster_volume": com_stats["cluster_volume"],
+            "cluster_volume_min": com_stats["cluster_volume_min"],
+            "cluster_volume_max": com_stats["cluster_volume_max"],
+            "cluster_volume_entropy": com_stats["cluster_volume_entropy"],
+            "assignment_entropy": com_stats["assignment_entropy"],
         }
 
     def _sample_to_device(self, sample: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, ...]:
@@ -361,10 +386,15 @@ class TGCTrainer:
         self.opt.step()
         return {
             "loss_total": float(loss_terms["loss_total"].item()),
+            "loss_tppr_cut": float(loss_terms["loss_tppr_cut"].item()),
+            "loss_assign_penalty": float(loss_terms["loss_assign_penalty"].item()),
+            "loss_com": float(loss_terms["loss_com"].item()),
             "loss_cut_base": float(loss_terms["loss_cut_base"].item()),
             "loss_temp": float(loss_terms["loss_temp"].item()),
             "loss_batch": float(loss_terms["loss_batch"].item()),
             "loss_bal": float(loss_terms["loss_bal"].item()),
+            "weighted_com": float(loss_terms["weighted_com"].item()),
+            "weighted_assign_penalty": float(loss_terms["weighted_assign_penalty"].item()),
             "weighted_cut_base": float(loss_terms["weighted_cut_base"].item()),
             "weighted_temp": float(loss_terms["weighted_temp"].item()),
             "weighted_batch": float(loss_terms["weighted_batch"].item()),
@@ -467,7 +497,7 @@ class TGCTrainer:
 
         if save_final:
             self._save_predictions(self.final_prediction_paths, predictions)
-            main_pred = predictions["argmax_s"] if self.objective_mode == "cut_main" else predictions["kmeans_z"]
+            main_pred = predictions["kmeans_z"]
             save_prediction_file(self.pred_path, main_pred)
             np.save(self.soft_assignment_path, assign)
             self.save_node_embeddings(self.emb_path)
@@ -483,14 +513,21 @@ class TGCTrainer:
             "pi_cut_nnz": self.pi_cut_nnz,
             "pi_cut_density": self.pi_cut_density,
             "loss_total": epoch_stats["loss_total"],
+            "loss_tppr_cut": epoch_stats["loss_tppr_cut"],
+            "loss_assign_penalty": epoch_stats["loss_assign_penalty"],
+            "loss_com": epoch_stats["loss_com"],
             "loss_cut_base": epoch_stats["loss_cut_base"],
             "loss_temp": epoch_stats["loss_temp"],
             "loss_batch": epoch_stats["loss_batch"],
             "loss_bal": epoch_stats["loss_bal"],
+            "weighted_com": epoch_stats["weighted_com"],
+            "weighted_assign_penalty": epoch_stats["weighted_assign_penalty"],
             "weighted_cut_base": epoch_stats["weighted_cut_base"],
             "weighted_temp": epoch_stats["weighted_temp"],
             "weighted_batch": epoch_stats["weighted_batch"],
             "weighted_bal": epoch_stats["weighted_bal"],
+            "rho_assign": self.rho_assign,
+            "lambda_com": self.lambda_com,
             "cluster_mass": epoch_stats["cluster_mass"],
             "cluster_volume": epoch_stats["cluster_volume"],
             "cluster_volume_min": epoch_stats["cluster_volume_min"],
@@ -518,12 +555,14 @@ class TGCTrainer:
             writer = csv.DictWriter(writer_file, fieldnames=METRIC_COLUMNS)
             writer.writerow(metric_row)
 
-        main_method = "argmax_s" if self.objective_mode == "cut_main" else "kmeans_z"
+        main_method = "kmeans_z"
         print(
             f"[Eval] epoch={epoch_num} phase={metric_row['phase']} "
-            f"loss_total={metric_row['loss_total']:.4f} loss_cut_base={metric_row['loss_cut_base']:.4f} "
+            f"loss_total={metric_row['loss_total']:.4f} loss_tppr_cut={metric_row['loss_tppr_cut']:.4f} "
+            f"loss_com={metric_row['loss_com']:.4f} "
             f"loss_temp={metric_row['loss_temp']:.4f} loss_batch={metric_row['loss_batch']:.4f} "
-            f"loss_bal={metric_row['loss_bal']:.4f} weighted_bal={metric_row['weighted_bal']:.4f} "
+            f"loss_assign_penalty={metric_row['loss_assign_penalty']:.4f} "
+            f"weighted_com={metric_row['weighted_com']:.4f} "
             f"cluster_volume_min={metric_row['cluster_volume_min']:.4f} "
             f"cluster_volume_max={metric_row['cluster_volume_max']:.4f} "
             f"assignment_entropy={metric_row['assignment_entropy']:.4f} "
@@ -550,10 +589,15 @@ class TGCTrainer:
             probe_batch = None
             epoch_sums = {
                 "loss_total": 0.0,
+                "loss_tppr_cut": 0.0,
+                "loss_assign_penalty": 0.0,
+                "loss_com": 0.0,
                 "loss_cut_base": 0.0,
                 "loss_temp": 0.0,
                 "loss_batch": 0.0,
                 "loss_bal": 0.0,
+                "weighted_com": 0.0,
+                "weighted_assign_penalty": 0.0,
                 "weighted_cut_base": 0.0,
                 "weighted_temp": 0.0,
                 "weighted_batch": 0.0,
@@ -600,10 +644,10 @@ class TGCTrainer:
                 f"pi_asymmetry_norm={self.pi_asymmetry_norm:.4e} "
                 f"pi_cut_density={self.pi_cut_density:.4e} "
                 f"loss_total={epoch_avgs['loss_total']:.4f} "
-                f"weighted_cut_base={epoch_avgs['weighted_cut_base']:.4f} "
+                f"weighted_com={epoch_avgs['weighted_com']:.4f} "
                 f"weighted_temp={epoch_avgs['weighted_temp']:.4f} "
                 f"weighted_batch={epoch_avgs['weighted_batch']:.4f} "
-                f"weighted_bal={epoch_avgs['weighted_bal']:.4f} "
+                f"weighted_assign_penalty={epoch_avgs['weighted_assign_penalty']:.4f} "
                 f"cluster_volume_min={epoch_avgs['cluster_volume_min']:.4f} "
                 f"cluster_volume_max={epoch_avgs['cluster_volume_max']:.4f} "
                 f"assignment_entropy={epoch_avgs['assignment_entropy']:.4f}"
