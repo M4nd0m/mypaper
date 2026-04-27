@@ -272,9 +272,11 @@ The cache key includes `taps_budget_mode`, `taps_budget_beta`, and the computed 
 ## 9. Implementation mapping
 
 - `HINOS/main.py`: CLI arguments for objective weights, assignment mode, prototype alpha, and main prediction export.
-- `HINOS/trainer.py`: prototype assignment, MLP assignment ablation, community loss ramp-up, temporal loss, batch reconstruction, diagnostics, and prediction export.
+- `HINOS/trainer.py`: prototype assignment, MLP assignment ablation, community loss ramp-up, temporal loss, community-aware compact batch reconstruction, diagnostics, and prediction export.
 - `HINOS/sparsification.py`: adaptive TAPS budget selection, TPPR construction, and cut graph construction via `compute_tppr_cached(...)` and `build_ncut_graph(...)`.
 - Pretrained embeddings: initialize both \(Z\) and prototype centers when `--assign_mode prototype`.
+
+`--lambda_bal` is retained only for CLI compatibility. It does not add an independent balance loss to `loss_total`; use `--rho_assign` to control the assignment-prior component inside `L_com`.
 
 ## 10. Recommended commands
 
@@ -291,13 +293,14 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
+  --batch_recon_mode soft_pseudo \
   --warmup_epochs 10 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.5 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --main_pred_mode kmeans_z \
+  --main_pred_mode argmax_s \
   --run_tag proto_kl_ramp_taps_nlogn_b05
 ```
 
@@ -314,13 +317,14 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
+  --batch_recon_mode soft_pseudo \
   --warmup_epochs 20 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.5 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --main_pred_mode kmeans_z \
+  --main_pred_mode argmax_s \
   --run_tag proto_kl_100_taps_nlogn_b05
 ```
 

@@ -83,15 +83,18 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
+  --batch_recon_mode soft_pseudo \
   --warmup_epochs 10 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.5 \
   --eval_interval 5 \
   --grad_eval_interval 5 \
-  --main_pred_mode kmeans_z \
+  --main_pred_mode argmax_s \
   --run_tag proto_kl_ramp_taps_nlogn_b05
 ```
+
+For `cut_main`, `argmax_s` is the default main prediction and `soft_pseudo` is the recommended compact batch reconstruction mode. See `METHOD_NOTES.md` for the current three-term loss definition and the legacy `lambda_bal` compatibility note.
 
 If `node2label.txt` is unavailable or you do not want to rely on it for inferring the cluster count, pass `--num_clusters` explicitly:
 

@@ -102,6 +102,7 @@ class TGCTrainer:
         self.assign_mode = args.assign_mode
         self.prototype_alpha = float(args.prototype_alpha)
         self.main_pred_mode = args.main_pred_mode
+        self.batch_recon_mode = args.batch_recon_mode
 
         self.file_path = os.path.join(args.data_root, self.dataset_name, f"{self.dataset_name}.txt")
         self.label_path = os.path.join(args.data_root, self.dataset_name, "node2label.txt")
@@ -338,6 +339,38 @@ class TGCTrainer:
         progress = float(epoch_idx + 1 - self.warmup_epochs) / float(max(1, self.com_ramp_epochs))
         return self.lambda_com * min(1.0, max(0.0, progress))
 
+    def _community_reconstruction_targets(
+        self,
+        assign: torch.Tensor,
+        s_nodes: torch.Tensor,
+        t_nodes: torch.Tensor,
+        h_nodes: torch.Tensor,
+        h_time_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch = s_nodes.size(0)
+        s_assign = assign.index_select(0, s_nodes)
+        t_assign = assign.index_select(0, t_nodes)
+
+        if self.batch_recon_mode == "ones":
+            target_st = torch.ones(batch, device=assign.device, dtype=assign.dtype)
+            target_sh = torch.ones_like(h_time_mask, dtype=assign.dtype)
+        elif self.batch_recon_mode == "hard_pseudo":
+            s_label = s_assign.argmax(dim=1)
+            t_label = t_assign.argmax(dim=1)
+            target_st = (s_label == t_label).to(assign.dtype)
+            h_label = assign.index_select(0, h_nodes.view(-1)).argmax(dim=1).view(batch, self.hist_len)
+            target_sh = (s_label.unsqueeze(1) == h_label).to(assign.dtype)
+        elif self.batch_recon_mode == "soft_pseudo":
+            target_st = (s_assign * t_assign).sum(dim=1)
+            h_assign = assign.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, self.K)
+            target_sh = (s_assign.unsqueeze(1) * h_assign).sum(dim=2)
+        else:
+            raise ValueError(f"Unknown batch_recon_mode: {self.batch_recon_mode}")
+
+        target_st = target_st.clamp(0.0, 1.0).detach()
+        target_sh = target_sh.clamp(0.0, 1.0).detach() * h_time_mask
+        return target_st, target_sh
+
     def compute_loss_terms(
         self,
         s_nodes: torch.Tensor,
@@ -357,16 +390,19 @@ class TGCTrainer:
         h_node_emb = self.node_emb.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, -1)
         n_node_emb = self.node_emb.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, -1)
 
-        new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
-        res_st_loss = torch.norm(1 - new_st_adj, p=2, dim=0)
+        assign = self._assignment()
+        target_st, target_sh = self._community_reconstruction_targets(assign, s_nodes, t_nodes, h_nodes, h_time_mask)
 
+        new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
         new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
         new_sh_adj = new_sh_adj * h_time_mask
         new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
 
-        res_sh_loss = torch.norm(1 - new_sh_adj, p=2, dim=0).sum(dim=0)
-        res_sn_loss = torch.norm(new_sn_adj, p=2, dim=0).sum(dim=0)
-        l_batch = (res_st_loss + res_sh_loss + res_sn_loss) / max(1, batch)
+        eps = 1e-6
+        l_batch_pos = F.mse_loss(new_st_adj, target_st, reduction="mean")
+        l_batch_hist = ((new_sh_adj - target_sh).pow(2) * h_time_mask).sum() / (h_time_mask.sum() + eps)
+        l_batch_neg = new_sn_adj.pow(2).mean()
+        l_batch = l_batch_pos + l_batch_hist + l_batch_neg
 
         att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
         p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
@@ -384,7 +420,6 @@ class TGCTrainer:
         loss_pair = -torch.log(p_lambda.sigmoid() + 1e-6) - torch.log(n_lambda.neg().sigmoid() + 1e-6).sum(dim=1)
         l_temp = loss_pair.mean()
 
-        assign = self._assignment()
         l_tppr_cut, l_assign, l_com, com_stats = self._compute_community_terms(assign)
 
         phase = self._loss_phase(epoch_idx)

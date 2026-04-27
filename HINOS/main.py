@@ -92,7 +92,19 @@ def get_args():
         help="temporal loss weight",
     )
     parser.add_argument("--lambda_batch", type=float, default=None, help="batch reconstruction loss weight")
-    parser.add_argument("--lambda_bal", type=float, default=None, help="degree-aware balance penalty weight")
+    parser.add_argument(
+        "--batch_recon_mode",
+        type=str,
+        default=None,
+        choices=["ones", "soft_pseudo", "hard_pseudo"],
+        help="batch reconstruction target mode: ones is legacy; soft_pseudo/hard_pseudo use stop-gradient assignments",
+    )
+    parser.add_argument(
+        "--lambda_bal",
+        type=float,
+        default=None,
+        help="legacy compatibility flag; does not add an extra loss term. Use --rho_assign for the assignment prior inside L_com",
+    )
     parser.add_argument("--lambda_ncut_orth", type=float, default=None, help="legacy alias for balance weight")
     parser.add_argument("--cluster_hidden_dim", type=int, default=64, help="cluster MLP hidden dimension")
     parser.add_argument("--warmup_epochs", type=int, default=0, help="warmup epochs before cut_main")
@@ -122,6 +134,8 @@ def apply_objective_defaults(args):
             args.lambda_batch = 0.01
         if args.lambda_bal is None:
             args.lambda_bal = 0.0
+        if args.batch_recon_mode is None:
+            args.batch_recon_mode = "soft_pseudo"
     else:
         if args.lambda_com is None:
             args.lambda_com = 0.1
@@ -132,6 +146,8 @@ def apply_objective_defaults(args):
             args.lambda_batch = 1.0
         if args.lambda_bal is None:
             args.lambda_bal = 0.0
+        if args.batch_recon_mode is None:
+            args.batch_recon_mode = "ones"
     if args.main_pred_mode is None:
         if args.objective_mode == "cut_main":
             args.main_pred_mode = "argmax_s"
@@ -167,8 +183,9 @@ def main():
     print(
         f"[Loss] lambda_temp={args.lambda_temp}, lambda_com={args.lambda_com}, "
         f"lambda_batch={args.lambda_batch}, rho_assign={args.rho_assign}, "
-        f"legacy_lambda_bal={args.lambda_bal}"
+        f"legacy_lambda_bal={args.lambda_bal} (diagnostic only)"
     )
+    print(f"[BatchRecon] mode={args.batch_recon_mode}")
     print(f"[Assign] mode={args.assign_mode}, prototype_alpha={args.prototype_alpha}, main_pred={args.main_pred_mode}")
     print(f"[NCut] hidden_dim={args.cluster_hidden_dim}, spectral_topk={args.spectral_topk}, scope=full")
     print(f"[Cluster] num_clusters   = {args.num_clusters if args.num_clusters > 0 else 'auto-from-labels'}")
