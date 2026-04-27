@@ -103,6 +103,7 @@ class TGCTrainer:
         self.prototype_alpha = float(args.prototype_alpha)
         self.main_pred_mode = args.main_pred_mode
         self.batch_recon_mode = args.batch_recon_mode
+        self.pseudo_conf_threshold = float(args.pseudo_conf_threshold)
 
         self.file_path = os.path.join(args.data_root, self.dataset_name, f"{self.dataset_name}.txt")
         self.label_path = os.path.join(args.data_root, self.dataset_name, "node2label.txt")
@@ -172,7 +173,6 @@ class TGCTrainer:
         self.ncut_graph_csr.sort_indices()
         self.pi_cut_csr = self.ncut_graph_csr
         self._prepare_full_ncut_tensors()
-        self.prior_target = self._build_prior_target()
 
         self.K = int(self.num_clusters)
         self.neg_size = int(args.neg_size)
@@ -237,33 +237,6 @@ class TGCTrainer:
         total_entries = float(self.pi_cut_csr.shape[0] * self.pi_cut_csr.shape[1])
         self.pi_cut_density = float(self.pi_cut_nnz / total_entries) if total_entries > 0 else 0.0
 
-    def _build_prior_target(self) -> torch.Tensor:
-        eps = 1e-6
-        feature = torch.from_numpy(self.feature).float().to(self.device)
-        centers_np = KMeans(
-            n_clusters=self.num_clusters,
-            n_init=10,
-            random_state=self.seed,
-        ).fit(self.feature).cluster_centers_
-        centers = torch.from_numpy(centers_np.astype(np.float32)).float().to(self.device)
-
-        alpha = max(float(self.prototype_alpha), eps)
-        dist = torch.cdist(feature, centers, p=2).pow(2)
-        q0 = (1.0 + dist / alpha).pow(-(alpha + 1.0) / 2.0)
-        q0 = q0 / (q0.sum(dim=1, keepdim=True) + eps)
-
-        degree = self.pi_cut_degree
-        degree_sum = degree.sum()
-        if float(degree_sum.detach().item()) > eps:
-            degree_prob = degree / (degree_sum + eps)
-        else:
-            degree_prob = torch.full_like(degree, 1.0 / max(1, degree.numel()))
-
-        f0 = (degree_prob.unsqueeze(1) * q0).sum(dim=0)
-        p0 = q0.pow(2) / (f0.unsqueeze(0) + eps)
-        p0 = p0 / (p0.sum(dim=1, keepdim=True) + eps)
-        return p0.detach()
-
     def _assignment(self) -> torch.Tensor:
         if self.assign_mode == "prototype":
             return self._prototype_assignment()
@@ -292,7 +265,11 @@ class TGCTrainer:
         else:
             degree_prob = torch.full_like(degree, 1.0 / max(1, degree.numel()))
 
-        target = self.prior_target
+        f = assign.t().mv(degree_prob)
+        target = assign.pow(2) / (f.unsqueeze(0) + eps)
+        target = target / (target.sum(dim=1, keepdim=True) + eps)
+        target = target.detach()
+
         assign_safe = assign.clamp_min(eps)
         l_assign = degree_prob.unsqueeze(1) * target * torch.log((target + eps) / assign_safe)
         l_assign = l_assign.sum()
@@ -346,7 +323,7 @@ class TGCTrainer:
         t_nodes: torch.Tensor,
         h_nodes: torch.Tensor,
         h_time_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = s_nodes.size(0)
         s_assign = assign.index_select(0, s_nodes)
         t_assign = assign.index_select(0, t_nodes)
@@ -354,22 +331,47 @@ class TGCTrainer:
         if self.batch_recon_mode == "ones":
             target_st = torch.ones(batch, device=assign.device, dtype=assign.dtype)
             target_sh = torch.ones_like(h_time_mask, dtype=assign.dtype)
+            mask_st = torch.ones_like(target_st)
+            mask_sh = h_time_mask.to(dtype=assign.dtype)
         elif self.batch_recon_mode == "hard_pseudo":
             s_label = s_assign.argmax(dim=1)
             t_label = t_assign.argmax(dim=1)
             target_st = (s_label == t_label).to(assign.dtype)
             h_label = assign.index_select(0, h_nodes.view(-1)).argmax(dim=1).view(batch, self.hist_len)
             target_sh = (s_label.unsqueeze(1) == h_label).to(assign.dtype)
+            mask_st = torch.ones_like(target_st)
+            mask_sh = h_time_mask.to(dtype=assign.dtype)
+        elif self.batch_recon_mode == "hard_pseudo_gate":
+            s_prob, s_label = s_assign.max(dim=1)
+            t_prob, t_label = t_assign.max(dim=1)
+            h_assign = assign.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, self.K)
+            h_prob, h_label = h_assign.max(dim=2)
+            conf = self.pseudo_conf_threshold
+
+            mask_st = (
+                (s_label == t_label) & (s_prob > conf) & (t_prob > conf)
+            ).to(assign.dtype).detach()
+            mask_sh = (
+                (s_label.unsqueeze(1) == h_label)
+                & (s_prob.unsqueeze(1) > conf)
+                & (h_prob > conf)
+            ).to(assign.dtype).detach() * h_time_mask.to(dtype=assign.dtype)
+            target_st = torch.ones_like(mask_st)
+            target_sh = torch.ones_like(mask_sh)
         elif self.batch_recon_mode == "soft_pseudo":
             target_st = (s_assign * t_assign).sum(dim=1)
             h_assign = assign.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, self.K)
             target_sh = (s_assign.unsqueeze(1) * h_assign).sum(dim=2)
+            mask_st = torch.ones_like(target_st)
+            mask_sh = h_time_mask.to(dtype=assign.dtype)
         else:
             raise ValueError(f"Unknown batch_recon_mode: {self.batch_recon_mode}")
 
         target_st = target_st.clamp(0.0, 1.0).detach()
-        target_sh = target_sh.clamp(0.0, 1.0).detach() * h_time_mask
-        return target_st, target_sh
+        target_sh = target_sh.clamp(0.0, 1.0).detach()
+        mask_st = mask_st.detach()
+        mask_sh = mask_sh.detach()
+        return target_st, target_sh, mask_st, mask_sh
 
     def compute_loss_terms(
         self,
@@ -391,16 +393,17 @@ class TGCTrainer:
         n_node_emb = self.node_emb.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, -1)
 
         assign = self._assignment()
-        target_st, target_sh = self._community_reconstruction_targets(assign, s_nodes, t_nodes, h_nodes, h_time_mask)
+        target_st, target_sh, mask_st, mask_sh = self._community_reconstruction_targets(
+            assign, s_nodes, t_nodes, h_nodes, h_time_mask
+        )
 
         new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
         new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
-        new_sh_adj = new_sh_adj * h_time_mask
         new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
 
         eps = 1e-6
-        l_batch_pos = F.mse_loss(new_st_adj, target_st, reduction="mean")
-        l_batch_hist = ((new_sh_adj - target_sh).pow(2) * h_time_mask).sum() / (h_time_mask.sum() + eps)
+        l_batch_pos = ((new_st_adj - target_st).pow(2) * mask_st).sum() / (mask_st.sum() + eps)
+        l_batch_hist = ((new_sh_adj - target_sh).pow(2) * mask_sh).sum() / (mask_sh.sum() + eps)
         l_batch_neg = new_sn_adj.pow(2).mean()
         l_batch = l_batch_pos + l_batch_hist + l_batch_neg
 

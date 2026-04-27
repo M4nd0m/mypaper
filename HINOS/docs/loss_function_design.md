@@ -278,6 +278,12 @@ The cache key includes `taps_budget_mode`, `taps_budget_beta`, and the computed 
 
 `--lambda_bal` is retained only for CLI compatibility. It does not add an independent balance loss to `loss_total`; use `--rho_assign` to control the assignment-prior component inside `L_com`.
 
+The assignment-prior target is dynamic: each step sharpens the current `S` with degree weighting and detaches that target before the KL-style assignment penalty. A fixed prior target is not used, because it can leave `S` high-entropy and make `argmax_s` collapse toward uniform assignments.
+
+For compact batch reconstruction, `cut_main` now defaults to `--batch_recon_mode ones`. `soft_pseudo` is retained only as an ablation. When `S` is high-entropy or close to uniform, `S_u S_v^T` is close to `1/K`, which lowers the positive-edge cosine target. `hard_pseudo_gate` is an optional experiment mode: it reconstructs only high-confidence same-pseudo-label observed edges, does not push cross-pseudo observed edges apart, and keeps negative sampling at cosine target `0`. This matches temporal graph clustering where an interaction does not necessarily imply same community.
+
+This repair follows the compact_batch results where DBLP final `argmax_s` dropped clearly, and School kept strong `kmeans_z` while `argmax_s` dropped. The issue is therefore the soft assignment `S`, not the embedding space alone. School saturates quickly, so DBLP is more informative for community boundary quality.
+
 ## 10. Recommended commands
 
 40-epoch debug run:
@@ -293,7 +299,7 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
-  --batch_recon_mode soft_pseudo \
+  --batch_recon_mode ones \
   --warmup_epochs 10 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \
@@ -317,7 +323,7 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
-  --batch_recon_mode soft_pseudo \
+  --batch_recon_mode ones \
   --warmup_epochs 20 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \

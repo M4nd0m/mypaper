@@ -96,8 +96,14 @@ def get_args():
         "--batch_recon_mode",
         type=str,
         default=None,
-        choices=["ones", "soft_pseudo", "hard_pseudo"],
-        help="batch reconstruction target mode: ones is legacy; soft_pseudo/hard_pseudo use stop-gradient assignments",
+        choices=["ones", "soft_pseudo", "hard_pseudo", "hard_pseudo_gate"],
+        help="batch reconstruction target mode: ones is legacy; pseudo modes use stop-gradient assignments",
+    )
+    parser.add_argument(
+        "--pseudo_conf_threshold",
+        type=float,
+        default=0.7,
+        help="confidence threshold for hard_pseudo_gate batch reconstruction",
     )
     parser.add_argument(
         "--lambda_bal",
@@ -135,7 +141,7 @@ def apply_objective_defaults(args):
         if args.lambda_bal is None:
             args.lambda_bal = 0.0
         if args.batch_recon_mode is None:
-            args.batch_recon_mode = "soft_pseudo"
+            args.batch_recon_mode = "ones"
     else:
         if args.lambda_com is None:
             args.lambda_com = 0.1

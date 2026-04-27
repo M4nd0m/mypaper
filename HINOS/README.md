@@ -83,7 +83,7 @@ python main.py \
   --lambda_com 1.0 \
   --rho_assign 0.1 \
   --lambda_batch 0.01 \
-  --batch_recon_mode soft_pseudo \
+  --batch_recon_mode ones \
   --warmup_epochs 10 \
   --com_ramp_epochs 20 \
   --taps_budget_mode nlogn \
@@ -94,7 +94,7 @@ python main.py \
   --run_tag proto_kl_ramp_taps_nlogn_b05
 ```
 
-For `cut_main`, `argmax_s` is the default main prediction and `soft_pseudo` is the recommended compact batch reconstruction mode. See `METHOD_NOTES.md` for the current three-term loss definition and the legacy `lambda_bal` compatibility note.
+For `cut_main`, `argmax_s` is the default main prediction and `ones` is the recommended compact batch reconstruction mode. `soft_pseudo` remains available as an ablation, but it is no longer the default because high-entropy assignments make `S_u S_v^T` approach `1/K`, lowering positive-edge cosine targets. `hard_pseudo_gate` is an optional experiment mode that reconstructs only high-confidence same-pseudo observed edges and leaves cross-pseudo observed edges neutral. See `METHOD_NOTES.md` for the current three-term loss definition and the legacy `lambda_bal` compatibility note.
 
 If `node2label.txt` is unavailable or you do not want to rely on it for inferring the cluster count, pass `--num_clusters` explicitly:
 
