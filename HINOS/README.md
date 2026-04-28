@@ -1,48 +1,130 @@
 # hinos_ncut_offline
 
-This project keeps only the offline training pipeline from the original HINOS codebase.
+This project adapts the offline stage of HINOS from temporal community search to full-graph temporal community discovery.
 
 Kept:
 - adaptive TAPS sampling
 - TPPR construction and caching
-- reconstruction loss
 - temporal loss
-- full-graph NCut loss
-- offline embedding optimization
-- offline cluster assignment export
+- batch reconstruction loss
+- TPPR-Cut community regularization
+- TGC-style Student-t assignment and KL alignment
+- HINOS TPPR-volume balance penalty
+- offline embedding and cluster assignment export
 
 Removed:
 - query-aware community search
 - BFS candidate generation
-- top-k evaluation
+- top-k retrieval evaluation
 - search-specific scoring arguments
 - F1-based early stopping
 
 ## Current Loss Function
 
-The current formal objective is:
+The training objective is:
 
 \[
 \mathcal{L}
 =
 \lambda_{\mathrm{temp}}\mathcal{L}_{\mathrm{temp}}
 +
-\lambda_{\mathrm{com}}\mathcal{L}_{\mathrm{com}}
+\lambda_{\mathrm{batch}}\mathcal{L}_{\mathrm{batch}}
 +
-\lambda_{\mathrm{batch}}\mathcal{L}_{\mathrm{batch}}.
+\frac{\lambda_{\mathrm{com}}^{(e)}}{B}\mathcal{L}_{\mathrm{com}}.
 \]
+
+The community discovery term is:
 
 \[
 \mathcal{L}_{\mathrm{com}}
 =
-\mathcal{L}_{\mathrm{TPPR\text{-}Cut}}
+\rho_{\mathrm{cut}}\mathcal{L}_{\mathrm{TPPR\text{-}Cut}}
 +
-\rho_{\mathrm{assign}}\mathcal{R}_{\Pi}(S).
+\rho_{\mathrm{KL}}\mathcal{L}_{\mathrm{TGC\text{-}KL}}
++
+\rho_{\mathrm{bal}}\mathcal{L}_{\mathrm{HINOS\text{-}Bal}}.
 \]
 
-TPPR + Cut is the core community-aware objective in this project. By default, the relaxed assignment \(S\) is computed by prototype-based Student-t assignment initialized from pretrained node2vec embeddings.
+By default, \(S\) is a TGC-style Student-t assignment \(Q\) from learnable prototype centers initialized by KMeans on pretrained node2vec embeddings. `argmax_s` is the default final clustering output for `cut_main`.
 
-See [docs/loss_function_design.md](docs/loss_function_design.md) for the full design and implementation mapping.
+See [docs/loss_function_design.md](docs/loss_function_design.md) for the full formula mapping.
+
+## Main Parameters
+
+- `--rho_cut`: weight for TPPR-Cut inside `L_com` (default `1.0`).
+- `--rho_kl`: weight for dynamic TGC KL inside `L_com` (default `1.0`).
+- `--rho_bal`: weight for HINOS balance inside `L_com` (default `0.1`).
+- `--prototype_lr_scale`: prototype-center learning-rate multiplier (default `0.1`).
+- `--target_update_interval`: epoch interval for refreshing the detached TGC target distribution (default `5`).
+- `--kl_target_mode`: `dynamic_tgc`, `fixed_initial`, or `none` (default `dynamic_tgc`).
+- `--balance_mode`: `hinos` or `none` (default `hinos`).
+
+Legacy aliases are still accepted:
+
+- `--rho_assign` maps to `--rho_kl` when `--rho_kl` is omitted.
+- `--lambda_bal` can initialize `--rho_bal` when nonzero and `--rho_bal` is omitted.
+
+## Recommended DBLP Run
+
+Run this on the GPU server:
+
+```bash
+cd HINOS
+python main.py \
+  --dataset dblp \
+  --objective_mode cut_main \
+  --assign_mode prototype \
+  --epoch 100 \
+  --lambda_temp 0.01 \
+  --lambda_batch 0.01 \
+  --lambda_com 0.2 \
+  --rho_cut 1.0 \
+  --rho_kl 1.0 \
+  --rho_bal 0.1 \
+  --prototype_alpha 1.0 \
+  --prototype_lr_scale 0.1 \
+  --target_update_interval 5 \
+  --kl_target_mode dynamic_tgc \
+  --balance_mode hinos \
+  --batch_recon_mode ones \
+  --warmup_epochs 20 \
+  --com_ramp_epochs 50 \
+  --eval_interval 5 \
+  --main_pred_mode argmax_s \
+  --taps_budget_mode nlogn \
+  --taps_budget_beta 0.1 \
+  --run_tag tgc_student_hinos_bal_tppr_cut
+```
+
+## Recommended School Run
+
+```bash
+cd HINOS
+python main.py \
+  --dataset school \
+  --objective_mode cut_main \
+  --assign_mode prototype \
+  --epoch 50 \
+  --lambda_temp 0.005 \
+  --lambda_batch 0.005 \
+  --lambda_com 0.5 \
+  --rho_cut 1.0 \
+  --rho_kl 1.0 \
+  --rho_bal 0.1 \
+  --prototype_alpha 1.0 \
+  --prototype_lr_scale 0.1 \
+  --target_update_interval 5 \
+  --kl_target_mode dynamic_tgc \
+  --balance_mode hinos \
+  --batch_recon_mode ones \
+  --warmup_epochs 5 \
+  --com_ramp_epochs 10 \
+  --eval_interval 5 \
+  --main_pred_mode argmax_s \
+  --taps_budget_mode nlogn \
+  --taps_budget_beta 0.5 \
+  --run_tag tgc_student_hinos_bal_tppr_cut
+```
 
 ## TAPS Budget
 
@@ -52,60 +134,24 @@ See [docs/loss_function_design.md](docs/loss_function_design.md) for the full de
 N_{\mathrm{TAPS}}=\lceil\sqrt{|\mathcal{E}_{\mathrm{static}}|}\rceil .
 \]
 
-For full-graph TPPR-Cut clustering, the recommended mode is `nlogn`:
+For full-graph TPPR-Cut clustering, the default and recommended mode is `nlogn`:
 
 \[
 N_{\mathrm{TAPS}}
 =
 \left\lceil
 \beta |\mathcal{V}|\log(|\mathcal{V}|+1)
-\right\rceil ,
+\right\rceil .
 \]
 
-where \(\beta\) is `--taps_budget_beta`. This is graph-adaptive, not a fixed sample count, and better matches the \(O(n\log n)\) scale commonly used for cut/spectral structure preservation. For School, `--taps_budget_beta 0.5` gives about 947 sampled paths before ceiling, with `computed_N_TAPS=948`.
+For School, `--taps_budget_beta 0.5` gives about 948 sampled paths.
 
-Run one dataset:
+## Outputs
 
-```bash
-python main.py --dataset school --epoch 30 --lambda_community 0.1
-```
-
-Recommended School TPPR-Cut run:
-
-```bash
-python main.py \
-  --dataset school \
-  --objective_mode cut_main \
-  --epoch 40 \
-  --assign_mode prototype \
-  --prototype_alpha 1.0 \
-  --lambda_temp 0.01 \
-  --lambda_com 1.0 \
-  --rho_assign 0.1 \
-  --lambda_batch 0.01 \
-  --batch_recon_mode ones \
-  --warmup_epochs 10 \
-  --com_ramp_epochs 20 \
-  --taps_budget_mode nlogn \
-  --taps_budget_beta 0.5 \
-  --eval_interval 5 \
-  --grad_eval_interval 5 \
-  --main_pred_mode argmax_s \
-  --run_tag proto_kl_ramp_taps_nlogn_b05
-```
-
-For `cut_main`, `argmax_s` is the default main prediction and `ones` is the recommended compact batch reconstruction mode. `soft_pseudo` remains available as an ablation, but it is no longer the default because high-entropy assignments make `S_u S_v^T` approach `1/K`, lowering positive-edge cosine targets. `hard_pseudo_gate` is an optional experiment mode that reconstructs only high-confidence same-pseudo observed edges and leaves cross-pseudo observed edges neutral. See `METHOD_NOTES.md` for the current three-term loss definition and the legacy `lambda_bal` compatibility note.
-
-If `node2label.txt` is unavailable or you do not want to rely on it for inferring the cluster count, pass `--num_clusters` explicitly:
-
-```bash
-python main.py --dataset school --epoch 30 --num_clusters 5
-```
-
-Outputs:
 - learned embeddings: `emb/<dataset>/<dataset>_TGC_<epoch>.emb`
 - hard cluster predictions: `emb/<dataset>/<dataset>_TGC_<epoch>_pred.txt`
 - soft assignment matrix: `emb/<dataset>/<dataset>_TGC_<epoch>_soft_assign.npy`
+- training metrics: `emb/<dataset>/<dataset>_TGC_<epoch>_metrics.csv`
 
 Evaluate clustering:
 
@@ -125,31 +171,28 @@ Metrics:
 - F1 (macro)
 - ARI
 
-Write evaluation results to CSV:
+## Diagnostics
+
+Track these columns in the metrics CSV:
+
+- `loss_tppr_cut`
+- `loss_assign_penalty` (TGC KL)
+- `loss_hinos_bal`
+- `weighted_cut`
+- `weighted_kl`
+- `weighted_hinos_bal`
+- `assignment_entropy`
+- `cluster_volume_min`
+- `cluster_volume_max`
+- `nmi_argmax_s`
+- `nmi_kmeans_z`
+- `nmi_spectral_pi`
+
+Static checks for local workstation use:
 
 ```bash
-python eval_to_csv.py --datasets school --epoch 30 --csv_path results/evaluation_results.csv
+python -m py_compile main.py trainer.py data_load.py sparsification.py clustering_utils.py evaluate.py
+python main.py --help
 ```
 
-Evaluate several datasets and append to the same CSV:
-
-```bash
-python eval_to_csv.py --datasets school dblp brain patent arXivAI arXivCS --epoch 100 --csv_path results/evaluation_results.csv --append --skip_missing
-```
-
-This is suitable for remote server runs because it writes a plain CSV file under the project directory by default:
-`results/evaluation_results.csv`.
-
-Run the default dataset sweep:
-
-```bash
-bash run_full.sh
-```
-
-The sweep script now runs `evaluate.py` after each dataset by default. To skip evaluation:
-
-```bash
-RUN_EVAL=0 bash run_full.sh
-```
-
-By default, `data_root`, `pretrain_emb_dir`, `cache_dir`, and `emb_root` all point to folders inside this project.
+Do full smoke tests and experiments on the GPU server.
