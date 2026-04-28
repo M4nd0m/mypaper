@@ -134,6 +134,7 @@ class TGCTrainer:
         self.num_clusters = self._resolve_num_clusters(int(args.num_clusters))
 
         self.node_emb = nn.Parameter(torch.from_numpy(self.feature).float().to(self.device))
+        self.pre_emb = torch.from_numpy(self.feature).float().to(self.device)
         self.delta = nn.Parameter((torch.zeros(self.node_dim) + 1.0).float().to(self.device))
 
         edges_uvt = read_temporal_edges(self.file_path)
@@ -151,6 +152,7 @@ class TGCTrainer:
             n_init=10,
             random_state=self.seed,
         ).fit(self.feature).cluster_centers_.astype(np.float32)
+        self.initial_cluster_centers_tensor = torch.from_numpy(self.initial_cluster_centers).float().to(self.device)
         if self.assign_mode == "prototype":
             self.cluster_prototypes = nn.Parameter(torch.from_numpy(self.initial_cluster_centers).float().to(self.device))
 
@@ -282,17 +284,49 @@ class TGCTrainer:
         return F.softmax(self.cluster_mlp(self.node_emb), dim=1)
 
     def _prototype_assignment(self) -> torch.Tensor:
+        return self._student_t_assignment(self.node_emb, self._kl_cluster_centers())
+
+    def _kl_cluster_centers(self) -> torch.Tensor:
+        if self.cluster_prototypes is not None:
+            return self.cluster_prototypes
+        return self.initial_cluster_centers_tensor
+
+    def _student_t_assignment(self, emb: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
         eps = 1e-6
         alpha = max(self.prototype_alpha, eps)
-        dist = torch.cdist(self.node_emb, self.cluster_prototypes, p=2).pow(2)
+        dist = torch.cdist(emb, centers, p=2).pow(2)
         q = (1.0 + dist / alpha).pow(-(alpha + 1.0) / 2.0)
-        return q / (q.sum(dim=1, keepdim=True) + eps)
+        q = q.clamp_min(eps)
+        return q / q.sum(dim=1, keepdim=True).clamp_min(eps)
 
     def _compute_tgc_target(self, assign: torch.Tensor) -> torch.Tensor:
         eps = 1e-6
         freq = assign.sum(dim=0, keepdim=True)
         target = assign.pow(2) / (freq + eps)
-        return target / (target.sum(dim=1, keepdim=True) + eps)
+        target = target.clamp_min(eps)
+        return target / target.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    def _compute_dtgc_batch_kl(self, s_nodes: torch.Tensor) -> torch.Tensor:
+        if self.kl_target_mode == "none":
+            return torch.tensor(0.0, device=self.device)
+
+        centers = self._kl_cluster_centers()
+        current_emb = self.node_emb.index_select(0, s_nodes.view(-1))
+        q_prime = self._student_t_assignment(current_emb, centers)
+
+        if self.kl_target_mode == "fixed_initial":
+            target = self.fixed_assignment_prior_target.index_select(0, s_nodes.view(-1))
+        else:
+            with torch.no_grad():
+                pre_emb = self.pre_emb.index_select(0, s_nodes.view(-1))
+                q0 = self._student_t_assignment(pre_emb, centers)
+                target = self._compute_tgc_target(q0)
+
+        target = target.detach().clamp_min(1e-6)
+        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        q_prime = q_prime.clamp_min(1e-6)
+        q_prime = q_prime / q_prime.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return F.kl_div(q_prime.log(), target, reduction="batchmean")
 
     def _maybe_update_assignment_target(self, assign: torch.Tensor, epoch_idx: int) -> Optional[torch.Tensor]:
         if self.kl_target_mode == "none":
@@ -331,7 +365,7 @@ class TGCTrainer:
         return penalty.clamp_min(0.0)
 
     def _compute_community_terms(
-        self, assign: torch.Tensor, epoch_idx: int
+        self, assign: torch.Tensor, epoch_idx: int, loss_assign_penalty: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
         eps = 1e-6
         cluster_mass = assign.sum(dim=0)
@@ -339,7 +373,11 @@ class TGCTrainer:
         volume_prob = cluster_volume / (cluster_volume.sum() + eps)
         assignment_entropy = -(assign * torch.log(assign + eps)).sum(dim=1).mean()
 
-        l_assign = self._compute_assignment_kl(assign, epoch_idx)
+        l_assign = (
+            loss_assign_penalty
+            if loss_assign_penalty is not None
+            else self._compute_assignment_kl(assign, epoch_idx)
+        )
         l_hinos_bal = self._compute_hinos_balance(assign)
 
         if self.full_ncut_edge_i.numel() == 0:
@@ -491,7 +529,10 @@ class TGCTrainer:
         loss_pair = -torch.log(p_lambda.sigmoid() + 1e-6) - torch.log(n_lambda.neg().sigmoid() + 1e-6).sum(dim=1)
         l_temp = loss_pair.mean()
 
-        l_tppr_cut, l_assign, l_hinos_bal, l_com, com_stats = self._compute_community_terms(assign, epoch_idx)
+        l_assign = self._compute_dtgc_batch_kl(s_nodes)
+        l_tppr_cut, l_assign, l_hinos_bal, l_com, com_stats = self._compute_community_terms(
+            assign, epoch_idx, loss_assign_penalty=l_assign
+        )
 
         phase = self._loss_phase(epoch_idx)
         effective_lambda_com = self._effective_lambda_com(epoch_idx)

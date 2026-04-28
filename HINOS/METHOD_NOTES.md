@@ -53,22 +53,24 @@ The final community label is:
 y_i = argmax_k Q_ik
 ```
 
-## Dynamic TGC KL
+## DTGC Batch-Level KL
 
-The target distribution is refreshed every `--target_update_interval` epochs:
-
-```text
-f_k = sum_i Q_ik
-P_ik = (Q_ik^2 / (f_k + eps)) / sum_l (Q_il^2 / (f_l + eps))
-```
-
-`P` is detached before KL is evaluated:
+For `kl_target_mode=dynamic_tgc`, the KL term follows the DTGC/TGC batch-level node distribution. For the current source-node batch \(B\), the detached target is built from fixed pretrained features \(Z^0\):
 
 ```text
-L_TGC-KL = sum_i sum_k P_ik * log((P_ik + eps) / (Q_ik + eps))
+q0 = StudentT(Z0_B, C)
+f_k = sum_{i in B} q0_ik
+P_ik = (q0_ik^2 / (f_k + eps)) / sum_l (q0_il^2 / (f_l + eps))
 ```
 
-`kl_target_mode=fixed_initial` is kept only for ablation of the previous fixed-prior experiment.
+The live distribution is computed from the current trainable embedding \(Z^t\):
+
+```text
+q_prime = StudentT(Zt_B, C)
+L_TGC-KL = KL(P || q_prime)
+```
+
+The implementation uses `F.kl_div(log(q_prime), P.detach(), reduction="batchmean")`. `target_update_interval` is kept only for command compatibility and does not control the main `dynamic_tgc` path. `kl_target_mode=fixed_initial` is kept only as an ablation of the previous fixed-prior experiment.
 
 ## HINOS Balance
 
@@ -103,7 +105,7 @@ python main.py \
   --dataset dblp \
   --objective_mode cut_main \
   --assign_mode prototype \
-  --epoch 100 \
+  --epoch 40 \
   --lambda_temp 0.01 \
   --lambda_batch 0.01 \
   --lambda_com 0.2 \
@@ -116,13 +118,13 @@ python main.py \
   --kl_target_mode dynamic_tgc \
   --balance_mode hinos \
   --batch_recon_mode ones \
-  --warmup_epochs 20 \
-  --com_ramp_epochs 50 \
+  --warmup_epochs 10 \
+  --com_ramp_epochs 20 \
   --eval_interval 5 \
   --main_pred_mode argmax_s \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.1 \
-  --run_tag tgc_student_hinos_bal_tppr_cut
+  --run_tag dblp_dtgc_batchkl_hinos_bal_e40
 ```
 
 Recommended School:
@@ -152,5 +154,5 @@ python main.py \
   --main_pred_mode argmax_s \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.5 \
-  --run_tag tgc_student_hinos_bal_tppr_cut
+  --run_tag school_dtgc_batchkl_hinos_bal_e50
 ```

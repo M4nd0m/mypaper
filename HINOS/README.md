@@ -52,10 +52,10 @@ See [docs/loss_function_design.md](docs/loss_function_design.md) for the full fo
 ## Main Parameters
 
 - `--rho_cut`: weight for TPPR-Cut inside `L_com` (default `1.0`).
-- `--rho_kl`: weight for dynamic TGC KL inside `L_com` (default `1.0`).
+- `--rho_kl`: weight for DTGC/TGC batch-level KL inside `L_com` (default `1.0`).
 - `--rho_bal`: weight for HINOS balance inside `L_com` (default `0.1`).
 - `--prototype_lr_scale`: prototype-center learning-rate multiplier (default `0.1`).
-- `--target_update_interval`: epoch interval for refreshing the detached TGC target distribution (default `5`).
+- `--target_update_interval`: legacy compatibility option; `dynamic_tgc` now builds DTGC batch targets directly.
 - `--kl_target_mode`: `dynamic_tgc`, `fixed_initial`, or `none` (default `dynamic_tgc`).
 - `--balance_mode`: `hinos` or `none` (default `hinos`).
 
@@ -74,7 +74,7 @@ python main.py \
   --dataset dblp \
   --objective_mode cut_main \
   --assign_mode prototype \
-  --epoch 100 \
+  --epoch 40 \
   --lambda_temp 0.01 \
   --lambda_batch 0.01 \
   --lambda_com 0.2 \
@@ -87,13 +87,13 @@ python main.py \
   --kl_target_mode dynamic_tgc \
   --balance_mode hinos \
   --batch_recon_mode ones \
-  --warmup_epochs 20 \
-  --com_ramp_epochs 50 \
+  --warmup_epochs 10 \
+  --com_ramp_epochs 20 \
   --eval_interval 5 \
   --main_pred_mode argmax_s \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.1 \
-  --run_tag tgc_student_hinos_bal_tppr_cut
+  --run_tag dblp_dtgc_batchkl_hinos_bal_e40
 ```
 
 ## Recommended School Run
@@ -123,7 +123,7 @@ python main.py \
   --main_pred_mode argmax_s \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.5 \
-  --run_tag tgc_student_hinos_bal_tppr_cut
+  --run_tag school_dtgc_batchkl_hinos_bal_e50
 ```
 
 ## TAPS Budget

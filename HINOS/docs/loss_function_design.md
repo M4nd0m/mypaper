@@ -77,24 +77,44 @@ Prototype centers are learnable, but they use a smaller learning rate:
 
 with default `--prototype_lr_scale 0.1`.
 
-## 3. Dynamic TGC KL
+## 3. DTGC Batch-Level KL
 
-Following TGC, the target distribution is a sharpened detached version of \(Q\). First compute cluster frequency:
+Following DTGC/TGC, the KL term uses a detached sharpened target from the fixed pretrained feature of the current source-node batch \(B\), not a cached full-graph target. First compute the Student-t distribution from \(Z^0\):
 
 \[
-f_k = \sum_{i=1}^{N}Q_{ik}.
+q^0_{ik}
+=
+\frac{
+\left(1+\lVert z_i^0-c_k\rVert_2^2/\nu\right)^{-\frac{\nu+1}{2}}
+}{
+\sum_{\ell=1}^{K}
+\left(1+\lVert z_i^0-c_\ell\rVert_2^2/\nu\right)^{-\frac{\nu+1}{2}}
+},
+\quad i\in B.
 \]
 
-Then:
+Then compute the batch target:
+
+\[
+f_k = \sum_{i\in B}q^0_{ik}.
+\]
 
 \[
 P_{ik}
 =
 \frac{
-Q_{ik}^{2}/(f_k+\epsilon)
+(q^0_{ik})^{2}/(f_k+\epsilon)
 }{
-\sum_{\ell=1}^{K}Q_{i\ell}^{2}/(f_\ell+\epsilon)+\epsilon
+\sum_{\ell=1}^{K}(q^0_{i\ell})^{2}/(f_\ell+\epsilon)+\epsilon
 }.
+\]
+
+The live assignment is computed from the current trainable embedding:
+
+\[
+q'_{ik}
+=
+\operatorname{StudentT}(z_i^t,c_k).
 \]
 
 The target is detached:
@@ -103,19 +123,26 @@ The target is detached:
 P \leftarrow \operatorname{stopgrad}(P).
 \]
 
-The KL term is:
+The KL term is normalized by batch size:
 
 \[
-\mathcal{L}_{\mathrm{TGC\text{-}KL}}
+\mathcal{L}_{\mathrm{TGC\text{-}KL}}^{(B)}
 =
-\sum_{i=1}^{N}
+\frac{1}{|B|}
+\sum_{i\in B}
 \sum_{k=1}^{K}
 P_{ik}
 \log
-\frac{P_{ik}+\epsilon}{Q_{ik}+\epsilon}.
+\frac{P_{ik}+\epsilon}{q'_{ik}+\epsilon}.
 \]
 
-The target refresh interval is controlled by `--target_update_interval` and defaults to 5 epochs. `--kl_target_mode fixed_initial` keeps the previous fixed-prior target only as an ablation.
+The full-graph current assignment
+
+\[
+Q=\operatorname{StudentT}(Z^t,C)
+\]
+
+is still used by TPPR-Cut, HINOS-Bal, and `argmax_s`. `target_update_interval` is retained only for command compatibility. `kl_target_mode fixed_initial` keeps the previous fixed-prior target only as an ablation.
 
 ## 4. TPPR-Cut
 

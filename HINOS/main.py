@@ -103,14 +103,14 @@ def get_args():
         "--target_update_interval",
         type=int,
         default=5,
-        help="epochs between dynamic TGC target distribution refreshes",
+        help="legacy interval kept for compatibility; dynamic_tgc now uses DTGC batch targets",
     )
     parser.add_argument(
         "--kl_target_mode",
         type=str,
         default="dynamic_tgc",
         choices=["dynamic_tgc", "fixed_initial", "none"],
-        help="assignment target used by the KL term",
+        help="assignment target used by the KL term; dynamic_tgc follows DTGC batch-level target construction",
     )
     parser.add_argument(
         "--balance_mode",
