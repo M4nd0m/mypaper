@@ -32,8 +32,21 @@ METRIC_COLUMNS = [
     "objective_mode",
     "pi_asymmetry_norm",
     "pi_cut_density",
+    "purity_at_5_pi",
+    "purity_at_10_pi",
+    "purity_at_20_pi",
+    "leakage_at_5_pi",
+    "leakage_at_10_pi",
+    "leakage_at_20_pi",
+    "ncut_gt_pi",
+    "tppr_cut_objective",
+    "tppr_cut_gamma",
     "loss_total",
     "loss_tppr_cut",
+    "loss_tppr_cut_raw",
+    "tppr_cut_expected_trace",
+    "tppr_cut_degree_trace",
+    "tppr_cut_dc_correction_trace",
     "loss_assign_penalty",
     "loss_hinos_bal",
     "loss_com",
@@ -161,6 +174,8 @@ class TGCTrainer:
         self.rho_cut = float(args.rho_cut)
         self.rho_kl = float(args.rho_kl)
         self.rho_bal = float(args.rho_bal)
+        self.tppr_cut_objective = args.tppr_cut_objective
+        self.tppr_cut_gamma = float(args.tppr_cut_gamma)
         self.lambda_cut = self.lambda_com
         self.lambda_temp = float(args.lambda_temp)
         self.lambda_batch = float(args.lambda_batch)
@@ -184,6 +199,7 @@ class TGCTrainer:
         self.pi_cut_csr = self.ncut_graph_csr
         self.K = int(self.num_clusters)
         self._prepare_full_ncut_tensors()
+        self.tppr_label_diagnostics = self._compute_tppr_label_diagnostics()
         self._prepare_fixed_assignment_prior_target()
 
         self.neg_size = int(args.neg_size)
@@ -210,7 +226,15 @@ class TGCTrainer:
         print(f"[Device] resolved        = {self.device}")
         print(f"[Assign] target_mode     = {self.kl_target_mode}")
         print(f"[Balance] mode           = {self.balance_mode}")
+        print(f"[TPPR-Cut] objective     = {self.tppr_cut_objective}")
+        print(f"[TPPR-Cut] gamma         = {self.tppr_cut_gamma}")
         print(f"[Assign] freeze_proto    = {self.freeze_prototypes if self.assign_mode == 'prototype' else 'n/a'}")
+        print(
+            "[TPPR Diag] "
+            f"purity@10={self.tppr_label_diagnostics['purity_at_10_pi']:.4f} "
+            f"leakage@10={self.tppr_label_diagnostics['leakage_at_10_pi']:.4f} "
+            f"ncut_gt={self.tppr_label_diagnostics['ncut_gt_pi']:.4f}"
+        )
 
     def _init_metrics_csv(self) -> None:
         ensure_dir(os.path.dirname(self.metrics_csv_path))
@@ -255,6 +279,79 @@ class TGCTrainer:
         self.pi_cut_nnz = int(self.pi_cut_csr.nnz)
         total_entries = float(self.pi_cut_csr.shape[0] * self.pi_cut_csr.shape[1])
         self.pi_cut_density = float(self.pi_cut_nnz / total_entries) if total_entries > 0 else 0.0
+
+    def _label_array_or_none(self) -> Optional[np.ndarray]:
+        if self.labels is None:
+            return None
+        labels = np.empty((self.node_dim,), dtype=np.int64)
+        for node_idx in range(self.node_dim):
+            if node_idx not in self.labels:
+                return None
+            labels[node_idx] = int(self.labels[node_idx])
+        return labels
+
+    def _compute_tppr_purity_at_k(self, labels: np.ndarray, k: int) -> float:
+        W = self.pi_cut_csr.tocsr()
+        total = 0.0
+        for node_idx in range(self.node_dim):
+            row_start, row_end = W.indptr[node_idx], W.indptr[node_idx + 1]
+            neigh = W.indices[row_start:row_end]
+            weights = W.data[row_start:row_end]
+            valid = neigh != node_idx
+            neigh = neigh[valid]
+            weights = weights[valid]
+            if neigh.size == 0:
+                continue
+            if neigh.size > k:
+                top_pos = np.argpartition(weights, -k)[-k:]
+                neigh = neigh[top_pos]
+                weights = weights[top_pos]
+                order = np.argsort(weights)[::-1]
+                neigh = neigh[order]
+            total += float(np.mean(labels[neigh] == labels[node_idx]))
+        return total / float(max(1, self.node_dim))
+
+    def _compute_gt_ncut_pi(self, labels: np.ndarray) -> float:
+        W = self.pi_cut_csr.tocsr()
+        degree = np.asarray(W.sum(axis=1)).ravel().astype(np.float64)
+        unique_labels = np.unique(labels)
+        ncut = 0.0
+        eps = 1e-12
+        for label in unique_labels:
+            in_cluster = labels == label
+            volume = float(degree[in_cluster].sum())
+            if volume <= eps:
+                continue
+            internal_assoc = 0.0
+            cluster_nodes = np.flatnonzero(in_cluster)
+            for node_idx in cluster_nodes:
+                row_start, row_end = W.indptr[node_idx], W.indptr[node_idx + 1]
+                neigh = W.indices[row_start:row_end]
+                weights = W.data[row_start:row_end]
+                internal_assoc += float(weights[in_cluster[neigh]].sum())
+            cut = max(0.0, volume - internal_assoc)
+            ncut += cut / (volume + eps)
+        return float(ncut)
+
+    def _compute_tppr_label_diagnostics(self) -> Dict[str, float]:
+        diag = {
+            "purity_at_5_pi": float("nan"),
+            "purity_at_10_pi": float("nan"),
+            "purity_at_20_pi": float("nan"),
+            "leakage_at_5_pi": float("nan"),
+            "leakage_at_10_pi": float("nan"),
+            "leakage_at_20_pi": float("nan"),
+            "ncut_gt_pi": float("nan"),
+        }
+        labels = self._label_array_or_none()
+        if labels is None:
+            return diag
+        for k in (5, 10, 20):
+            purity = self._compute_tppr_purity_at_k(labels, k)
+            diag[f"purity_at_{k}_pi"] = purity
+            diag[f"leakage_at_{k}_pi"] = 1.0 - purity
+        diag["ncut_gt_pi"] = self._compute_gt_ncut_pi(labels)
+        return diag
 
     def _prepare_fixed_assignment_prior_target(self) -> None:
         eps = 1e-6
@@ -364,6 +461,45 @@ class TGCTrainer:
         penalty = (sqrt_k - ratio) / max(sqrt_k - 1.0, eps)
         return penalty.clamp_min(0.0)
 
+    def _compute_tppr_cut(self, assign: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+        eps = 1e-6
+        zero = torch.tensor(0.0, device=self.device)
+        if self.full_ncut_edge_i.numel() == 0:
+            return zero, {
+                "loss_tppr_cut_raw": 0.0,
+                "tppr_cut_expected_trace": 0.0,
+                "tppr_cut_degree_trace": 0.0,
+                "tppr_cut_dc_correction_trace": 0.0,
+            }
+
+        delta = assign.index_select(0, self.full_ncut_edge_i) - assign.index_select(0, self.full_ncut_edge_j)
+        l_raw = delta.t().mm(self.full_ncut_edge_w.unsqueeze(1) * delta)
+        g_mat = assign.t().mm(self.full_ncut_degree.unsqueeze(1) * assign)
+        g_eps = g_mat + eps * torch.eye(self.K, device=self.device)
+
+        cluster_volume = assign.t().mm(self.full_ncut_degree.unsqueeze(1)).squeeze(1)
+        expected_mat = torch.outer(cluster_volume, cluster_volume) / (self.two_m_pi + eps)
+        correction_mat = expected_mat - g_mat
+
+        if self.tppr_cut_objective == "ncut":
+            l_mat = l_raw
+        elif self.tppr_cut_objective == "degree_corrected":
+            l_mat = l_raw + self.tppr_cut_gamma * correction_mat
+        else:
+            raise ValueError(f"Unknown tppr_cut_objective: {self.tppr_cut_objective}")
+
+        raw_trace = torch.trace(torch.linalg.solve(g_eps, l_raw))
+        expected_trace = torch.trace(torch.linalg.solve(g_eps, expected_mat))
+        degree_trace = torch.trace(torch.linalg.solve(g_eps, g_mat))
+        correction_trace = expected_trace - degree_trace
+        loss_tppr_cut = torch.trace(torch.linalg.solve(g_eps, l_mat))
+        return loss_tppr_cut.squeeze(), {
+            "loss_tppr_cut_raw": float(raw_trace.detach().item()),
+            "tppr_cut_expected_trace": float(expected_trace.detach().item()),
+            "tppr_cut_degree_trace": float(degree_trace.detach().item()),
+            "tppr_cut_dc_correction_trace": float(correction_trace.detach().item()),
+        }
+
     def _compute_community_terms(
         self, assign: torch.Tensor, epoch_idx: int, loss_assign_penalty: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
@@ -390,13 +526,13 @@ class TGCTrainer:
                 "cluster_volume_max": float(cluster_volume.max().item()),
                 "cluster_volume_entropy": float((-(volume_prob * torch.log(volume_prob + eps)).sum()).item()),
                 "assignment_entropy": float(assignment_entropy.item()),
+                "loss_tppr_cut_raw": 0.0,
+                "tppr_cut_expected_trace": 0.0,
+                "tppr_cut_degree_trace": 0.0,
+                "tppr_cut_dc_correction_trace": 0.0,
             }
 
-        delta = assign.index_select(0, self.full_ncut_edge_i) - assign.index_select(0, self.full_ncut_edge_j)
-        l_mat = delta.t().mm(self.full_ncut_edge_w.unsqueeze(1) * delta)
-        g_mat = assign.t().mm(self.full_ncut_degree.unsqueeze(1) * assign)
-        g_eps = g_mat + eps * torch.eye(self.K, device=self.device)
-        l_tppr_cut = torch.trace(torch.linalg.solve(g_eps, l_mat))
+        l_tppr_cut, cut_stats = self._compute_tppr_cut(assign)
         l_com = self.rho_cut * l_tppr_cut + self.rho_kl * l_assign + self.rho_bal * l_hinos_bal
 
         com_stats = {
@@ -406,6 +542,10 @@ class TGCTrainer:
             "cluster_volume_max": float(cluster_volume.max().item()),
             "cluster_volume_entropy": float((-(volume_prob * torch.log(volume_prob + eps)).sum()).item()),
             "assignment_entropy": float(assignment_entropy.item()),
+            "loss_tppr_cut_raw": cut_stats["loss_tppr_cut_raw"],
+            "tppr_cut_expected_trace": cut_stats["tppr_cut_expected_trace"],
+            "tppr_cut_degree_trace": cut_stats["tppr_cut_degree_trace"],
+            "tppr_cut_dc_correction_trace": cut_stats["tppr_cut_dc_correction_trace"],
         }
         return l_tppr_cut.squeeze(), l_assign.squeeze(), l_hinos_bal.squeeze(), l_com.squeeze(), com_stats
 
@@ -560,6 +700,10 @@ class TGCTrainer:
             "effective_lambda_com": effective_lambda_com,
             "loss_total": loss_total,
             "loss_tppr_cut": l_tppr_cut,
+            "loss_tppr_cut_raw": com_stats["loss_tppr_cut_raw"],
+            "tppr_cut_expected_trace": com_stats["tppr_cut_expected_trace"],
+            "tppr_cut_degree_trace": com_stats["tppr_cut_degree_trace"],
+            "tppr_cut_dc_correction_trace": com_stats["tppr_cut_dc_correction_trace"],
             "loss_assign_penalty": l_assign,
             "loss_hinos_bal": l_hinos_bal,
             "loss_com": l_com,
@@ -603,6 +747,10 @@ class TGCTrainer:
         return {
             "loss_total": float(loss_terms["loss_total"].item()),
             "loss_tppr_cut": float(loss_terms["loss_tppr_cut"].item()),
+            "loss_tppr_cut_raw": float(loss_terms["loss_tppr_cut_raw"]),
+            "tppr_cut_expected_trace": float(loss_terms["tppr_cut_expected_trace"]),
+            "tppr_cut_degree_trace": float(loss_terms["tppr_cut_degree_trace"]),
+            "tppr_cut_dc_correction_trace": float(loss_terms["tppr_cut_dc_correction_trace"]),
             "loss_assign_penalty": float(loss_terms["loss_assign_penalty"].item()),
             "loss_hinos_bal": float(loss_terms["loss_hinos_bal"].item()),
             "loss_com": float(loss_terms["loss_com"].item()),
@@ -717,8 +865,21 @@ class TGCTrainer:
             "objective_mode": self.objective_mode,
             "pi_asymmetry_norm": self.pi_asymmetry_norm,
             "pi_cut_density": self.pi_cut_density,
+            "purity_at_5_pi": self.tppr_label_diagnostics["purity_at_5_pi"],
+            "purity_at_10_pi": self.tppr_label_diagnostics["purity_at_10_pi"],
+            "purity_at_20_pi": self.tppr_label_diagnostics["purity_at_20_pi"],
+            "leakage_at_5_pi": self.tppr_label_diagnostics["leakage_at_5_pi"],
+            "leakage_at_10_pi": self.tppr_label_diagnostics["leakage_at_10_pi"],
+            "leakage_at_20_pi": self.tppr_label_diagnostics["leakage_at_20_pi"],
+            "ncut_gt_pi": self.tppr_label_diagnostics["ncut_gt_pi"],
+            "tppr_cut_objective": self.tppr_cut_objective,
+            "tppr_cut_gamma": self.tppr_cut_gamma,
             "loss_total": epoch_stats["loss_total"],
             "loss_tppr_cut": epoch_stats["loss_tppr_cut"],
+            "loss_tppr_cut_raw": epoch_stats["loss_tppr_cut_raw"],
+            "tppr_cut_expected_trace": epoch_stats["tppr_cut_expected_trace"],
+            "tppr_cut_degree_trace": epoch_stats["tppr_cut_degree_trace"],
+            "tppr_cut_dc_correction_trace": epoch_stats["tppr_cut_dc_correction_trace"],
             "loss_assign_penalty": epoch_stats["loss_assign_penalty"],
             "loss_hinos_bal": epoch_stats["loss_hinos_bal"],
             "loss_com": epoch_stats["loss_com"],
@@ -797,6 +958,10 @@ class TGCTrainer:
             epoch_sums = {
                 "loss_total": 0.0,
                 "loss_tppr_cut": 0.0,
+                "loss_tppr_cut_raw": 0.0,
+                "tppr_cut_expected_trace": 0.0,
+                "tppr_cut_degree_trace": 0.0,
+                "tppr_cut_dc_correction_trace": 0.0,
                 "loss_assign_penalty": 0.0,
                 "loss_hinos_bal": 0.0,
                 "loss_com": 0.0,

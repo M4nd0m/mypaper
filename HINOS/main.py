@@ -94,6 +94,19 @@ def get_args():
     parser.add_argument("--rho_kl", type=float, default=None, help="TGC dynamic KL weight inside L_com")
     parser.add_argument("--rho_bal", type=float, default=None, help="HINOS balance penalty weight inside L_com")
     parser.add_argument(
+        "--tppr_cut_objective",
+        type=str,
+        default="ncut",
+        choices=["ncut", "degree_corrected"],
+        help="internal TPPR-Cut numerator: original NCut or degree-corrected residual Laplacian",
+    )
+    parser.add_argument(
+        "--tppr_cut_gamma",
+        type=float,
+        default=1.0,
+        help="degree-correction strength used when --tppr_cut_objective=degree_corrected",
+    )
+    parser.add_argument(
         "--prototype_lr_scale",
         type=float,
         default=0.1,
@@ -234,6 +247,7 @@ def main():
         f"legacy_rho_assign={args.rho_assign}, "
         f"legacy_lambda_bal={args.lambda_bal} (diagnostic only)"
     )
+    print(f"[TPPR-Cut] objective={args.tppr_cut_objective}, gamma={args.tppr_cut_gamma}")
     print(f"[BatchRecon] mode={args.batch_recon_mode}")
     print(
         f"[Assign] mode={args.assign_mode}, prototype_alpha={args.prototype_alpha}, "

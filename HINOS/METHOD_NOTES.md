@@ -108,12 +108,12 @@ python main.py \
   --epoch 40 \
   --lambda_temp 0.01 \
   --lambda_batch 0.01 \
-  --lambda_com 0.2 \
-  --rho_cut 1.0 \
-  --rho_kl 1.0 \
-  --rho_bal 0.1 \
+  --lambda_com 1.0 \
+  --rho_cut 0.1 \
+  --rho_kl 10.0 \
+  --rho_bal 5.0 \
   --prototype_alpha 1.0 \
-  --prototype_lr_scale 0.1 \
+  --prototype_lr_scale 0.01 \
   --target_update_interval 5 \
   --kl_target_mode dynamic_tgc \
   --balance_mode hinos \
@@ -124,8 +124,24 @@ python main.py \
   --main_pred_mode argmax_s \
   --taps_budget_mode nlogn \
   --taps_budget_beta 0.1 \
-  --run_tag dblp_dtgc_batchkl_hinos_bal_e40
+  --run_tag dblp_tppr_diag_weakcut_rkl10_rbal5_e40
 ```
+
+The metrics CSV also records static TPPR-label diagnostics when labels are available:
+
+```text
+purity_at_5_pi, purity_at_10_pi, purity_at_20_pi
+leakage_at_5_pi, leakage_at_10_pi, leakage_at_20_pi
+ncut_gt_pi
+```
+
+For faster TPPR/TAPS parameter inspection without training, use:
+
+```bash
+python diagnose_tppr.py --dataset dblp --tppr_K 3 --taps_budget_beta 0.05 --spectral_topk 20
+```
+
+Treat `tppr_K=1` only as a first-order lower-bound diagnostic. Main candidates should remain moderate-order TPPR settings such as `tppr_K` in `{2, 3, 4, 5}`.
 
 Recommended School:
 
