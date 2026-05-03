@@ -3,11 +3,11 @@ set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
 
-EPOCH="${EPOCH:-60}"
+EPOCH="${EPOCH:-40}"
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-10}"
 COM_RAMP_EPOCHS="${COM_RAMP_EPOCHS:-30}"
 LOG_DIR="${LOG_DIR:-logs/dblp}"
-RUN_PREFIX="${RUN_PREFIX:-overnight_dc_cut_k3_beta03_e${EPOCH}}"
+RUN_PREFIX="${RUN_PREFIX:-dblp_raw_tppr_cut_k3_beta03_e${EPOCH}}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/${RUN_PREFIX}_$(date +%Y%m%d_%H%M%S).log}"
 
 mkdir -p "$LOG_DIR"
@@ -15,14 +15,12 @@ mkdir -p "$LOG_DIR"
 echo "[DBLP] unified log: $LOG_FILE" | tee -a "$LOG_FILE"
 
 run_dblp() {
-  local objective="$1"
-  local gamma="$2"
-  local tag="$3"
+  local tag="$1"
 
   {
     echo "============================================================"
     echo "[DBLP] start=$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[DBLP] objective=${objective} gamma=${gamma} tag=${tag}"
+    echo "[DBLP] raw TPPR-Cut tag=${tag}"
     echo "============================================================"
 
     "$PYTHON" main.py \
@@ -41,8 +39,6 @@ run_dblp() {
       --tppr_K 3 \
       --taps_budget_mode nlogn \
       --taps_budget_beta 0.3 \
-      --tppr_cut_objective "$objective" \
-      --tppr_cut_gamma "$gamma" \
       --target_update_interval 5 \
       --kl_target_mode dynamic_tgc \
       --balance_mode hinos \
@@ -58,10 +54,7 @@ run_dblp() {
   } 2>&1 | tee -a "$LOG_FILE"
 }
 
-run_dblp ncut 1.0 "${RUN_PREFIX}_raw_ncut"
-run_dblp degree_corrected 0.25 "${RUN_PREFIX}_dc_gamma025"
-run_dblp degree_corrected 0.5 "${RUN_PREFIX}_dc_gamma05"
-run_dblp degree_corrected 1.0 "${RUN_PREFIX}_dc_gamma1"
+run_dblp "${RUN_PREFIX}_raw_ncut"
 
 echo "[DBLP] all runs finished. unified log: $LOG_FILE" | tee -a "$LOG_FILE"
 echo "[DBLP] metrics files are under emb/dblp with prefix: dblp_TGC_${EPOCH}_${RUN_PREFIX}_"

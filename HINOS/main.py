@@ -26,7 +26,7 @@ def get_args():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=42, help="random seed")
-    parser.add_argument("--num_workers", type=int, default=1, help="DataLoader workers")
+    parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
     parser.add_argument("--neg_table_size", type=int, default=int(1e6), help="negative sampling table size")
 
     parser.add_argument("--data_root", type=str, default=os.path.join(cur_dir, "dataset"), help="dataset root")
@@ -93,18 +93,15 @@ def get_args():
     parser.add_argument("--rho_cut", type=float, default=None, help="TPPR-Cut weight inside L_com")
     parser.add_argument("--rho_kl", type=float, default=None, help="TGC dynamic KL weight inside L_com")
     parser.add_argument("--rho_bal", type=float, default=None, help="HINOS balance penalty weight inside L_com")
+    parser.add_argument("--unified_mode", type=str, default="off", choices=["off", "on"], help="learn sparse TPPR-anchored U")
+    parser.add_argument("--rho_anchor", type=float, default=1.0, help="anchor weight for learned U")
+    parser.add_argument("--U_init_mode", type=str, default="log_pi", choices=["log_pi", "uniform"], help="sparse U initialization")
     parser.add_argument(
-        "--tppr_cut_objective",
-        type=str,
-        default="ncut",
-        choices=["ncut", "degree_corrected"],
-        help="internal TPPR-Cut numerator: original NCut or degree-corrected residual Laplacian",
-    )
-    parser.add_argument(
-        "--tppr_cut_gamma",
-        type=float,
-        default=1.0,
-        help="degree-correction strength used when --tppr_cut_objective=degree_corrected",
+        "--log_unified_align",
+        type=int,
+        default=0,
+        help="log unified graph alignment diagnostics (spec_gap_*, nmi_spectral_W_U, etc); "
+        "default 0 keeps Phase 0 baseline free of new eval cost; pass 1 for Phase 1b",
     )
     parser.add_argument(
         "--prototype_lr_scale",
@@ -243,11 +240,10 @@ def main():
     print(
         f"[Loss] lambda_temp={args.lambda_temp}, lambda_com={args.lambda_com}, "
         f"lambda_batch={args.lambda_batch}, rho_cut={args.rho_cut}, "
-        f"rho_kl={args.rho_kl}, rho_bal={args.rho_bal}, "
+        f"rho_kl={args.rho_kl}, rho_bal={args.rho_bal}, rho_anchor={args.rho_anchor}, "
         f"legacy_rho_assign={args.rho_assign}, "
         f"legacy_lambda_bal={args.lambda_bal} (diagnostic only)"
     )
-    print(f"[TPPR-Cut] objective={args.tppr_cut_objective}, gamma={args.tppr_cut_gamma}")
     print(f"[BatchRecon] mode={args.batch_recon_mode}")
     print(
         f"[Assign] mode={args.assign_mode}, prototype_alpha={args.prototype_alpha}, "
@@ -256,6 +252,7 @@ def main():
         f"main_pred={args.main_pred_mode}"
     )
     print(f"[Balance] mode={args.balance_mode}")
+    print(f"[Unified] mode={args.unified_mode}, U_init={args.U_init_mode}, log_align={args.log_unified_align}")
     print(f"[NCut] hidden_dim={args.cluster_hidden_dim}, spectral_topk={args.spectral_topk}, scope=full")
     print(f"[Cluster] num_clusters   = {args.num_clusters if args.num_clusters > 0 else 'auto-from-labels'}")
     print(f"[Path] data_root         = {args.data_root}")

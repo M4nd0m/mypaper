@@ -93,6 +93,43 @@ def ncut_gt_pi(W, labels: np.ndarray) -> float:
     return float(ncut)
 
 
+def label_random_baseline(labels: np.ndarray) -> float:
+    _, counts = np.unique(labels, return_counts=True)
+    probs = counts.astype(np.float64) / float(labels.shape[0])
+    return float(np.sum(probs * probs))
+
+
+def tppr_weighted_label_purity(W, labels: np.ndarray) -> Dict[str, float]:
+    W = W.tocsr()
+    same_mass = 0.0
+    cross_mass = 0.0
+    total_mass = 0.0
+    valid_edges = 0
+    for node_idx in range(labels.shape[0]):
+        row_start, row_end = W.indptr[node_idx], W.indptr[node_idx + 1]
+        neigh = W.indices[row_start:row_end]
+        weights = W.data[row_start:row_end].astype(np.float64, copy=False)
+        keep = neigh != node_idx
+        neigh = neigh[keep]
+        weights = weights[keep]
+        if neigh.size == 0:
+            continue
+        same = labels[neigh] == labels[node_idx]
+        same_mass += float(weights[same].sum())
+        cross_mass += float(weights[~same].sum())
+        total_mass += float(weights.sum())
+        valid_edges += int(neigh.size)
+    purity = same_mass / total_mass if total_mass > 0.0 else float("nan")
+    return {
+        "tppr_weighted_purity": purity,
+        "tppr_weighted_leakage": 1.0 - purity if not math.isnan(purity) else float("nan"),
+        "same_label_mass": same_mass,
+        "cross_label_mass": cross_mass,
+        "total_mass": total_mass,
+        "nonself_nnz": float(valid_edges),
+    }
+
+
 def spectral_nmi(affinity, labels: np.ndarray, num_clusters: int, seed: int, topk: Optional[int]):
     pred = spectral_cluster_affinity(affinity, num_clusters, random_state=seed, topk=topk)
     metrics = compute_clustering_metrics(labels, pred)
@@ -135,12 +172,23 @@ def main():
         ncut = float("nan")
         nmi_spectral = float("nan")
         nmi_spectral_topk = float("nan")
+        random_baseline = float("nan")
+        mass_diag = {
+            "tppr_weighted_purity": float("nan"),
+            "tppr_weighted_leakage": float("nan"),
+            "same_label_mass": float("nan"),
+            "cross_label_mass": float("nan"),
+            "total_mass": float("nan"),
+            "nonself_nnz": float("nan"),
+        }
         labeled_nodes = 0
     else:
         num_clusters = int(np.unique(labels).size)
         purity = {k: purity_at_k(W, labels, k) for k in (5, 10, 20)}
         leakage = {k: 1.0 - purity[k] if not math.isnan(purity[k]) else float("nan") for k in (5, 10, 20)}
         ncut = ncut_gt_pi(W, labels)
+        random_baseline = label_random_baseline(labels)
+        mass_diag = tppr_weighted_label_purity(W, labels)
         nmi_spectral = spectral_nmi(tppr, labels, num_clusters, args.seed, topk=None)
         nmi_spectral_topk = spectral_nmi(tppr, labels, num_clusters, args.seed, topk=args.spectral_topk)
         labeled_nodes = int(labels.shape[0])
@@ -164,6 +212,13 @@ def main():
         f"leakage@5={format_float(leakage[5])} "
         f"leakage@10={format_float(leakage[10])} "
         f"leakage@20={format_float(leakage[20])}"
+    )
+    print(
+        f"tppr_weighted_purity_pi={format_float(mass_diag['tppr_weighted_purity'])} "
+        f"tppr_weighted_leakage_pi={format_float(mass_diag['tppr_weighted_leakage'])} "
+        f"random_same_label_baseline={format_float(random_baseline)} "
+        f"same_label_mass={format_float(mass_diag['same_label_mass'])} "
+        f"cross_label_mass={format_float(mass_diag['cross_label_mass'])}"
     )
     print(
         f"ncut_gt_pi={format_float(ncut)} "

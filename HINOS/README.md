@@ -59,6 +59,8 @@ See [docs/loss_function_design.md](docs/loss_function_design.md) for the full fo
 - `--kl_target_mode`: `dynamic_tgc`, `fixed_initial`, or `none` (default `dynamic_tgc`).
 - `--balance_mode`: `hinos` or `none` (default `hinos`).
 
+TPPR-Cut uses the raw symmetrized TPPR graph. The earlier full-null degree-corrected trace and edge-level residual variants were removed from the training path after ablations showed they changed loss values without improving the assignment trajectory.
+
 Legacy aliases are still accepted:
 
 - `--rho_assign` maps to `--rho_kl` when `--rho_kl` is omitted.

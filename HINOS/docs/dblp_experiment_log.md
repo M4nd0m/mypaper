@@ -217,6 +217,59 @@ Meaning:
 
    This explains why strong TPPR-Cut can reduce cut loss while hurting `argmax(Q)` NMI.
 
+## Prediction Cut Alignment Diagnostic
+
+To verify whether the trained model is failing to optimize TPPR-Cut or faithfully optimizing a TPPR-Cut direction that disagrees with the DBLP labels, we compared the ground-truth label partition and the final predicted partition on the same TPPR-Cut graph.
+
+Diagnostic setting:
+
+```text
+dataset = dblp
+tppr_K = 3
+taps_budget_beta = 0.3
+prediction = dblp_TGC_40_edge_residual_pos_k3_beta03_e40_raw_ncut_pred.txt
+```
+
+Result:
+
+| Metric | Value |
+|---|---:|
+| `ncut_gt_pi` | 4.589375 |
+| `ncut_pred_pi` | 2.645560 |
+| `ncut_pred_minus_gt` | -1.943815 |
+| `tppr_weighted_purity_gt` | 0.556417 |
+| `tppr_same_cluster_mass_ratio_pred` | 0.722427 |
+| `ACC` | 0.472530 |
+| `NMI` | 0.353463 |
+| `ARI` | 0.200951 |
+| `F1` | 0.440403 |
+
+Interpretation:
+
+- The predicted partition has a much lower TPPR Ncut than the ground-truth label partition:
+
+  \[
+  \mathrm{Ncut}_{\Pi}(\hat y)=2.6456
+  <
+  \mathrm{Ncut}_{\Pi}(y)=4.5894.
+  \]
+
+- The predicted partition also absorbs more TPPR edge weight into predicted clusters:
+
+  \[
+  \mathrm{SameMassRatio}_{\Pi}(\hat y)=0.7224
+  >
+  \mathrm{SameMassRatio}_{\Pi}(y)=0.5564.
+  \]
+
+- Therefore the model is not simply failing to optimize the cut term. It is finding a partition that is substantially better under raw TPPR-Cut, but that partition is only moderately aligned with DBLP labels:
+
+  \[
+  \mathrm{NMI}(\hat y,y)=0.3535.
+  \]
+
+This supports the diagnosis that, on DBLP, the raw TPPR-Cut optimum is not the same as the ground-truth label partition. Increasing the strength of raw TPPR-Cut is therefore likely to further favor low-cut TPPR partitions rather than improve label NMI.
+
 ## Current Recommendation
 
 Use two DBLP candidates depending on the priority:

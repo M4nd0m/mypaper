@@ -209,6 +209,48 @@ def purity_at_k_sparse(mat: csr_matrix, labels: np.ndarray, topk_values: Sequenc
     return rows
 
 
+def label_random_baseline(labels: np.ndarray) -> float:
+    _, counts = np.unique(labels, return_counts=True)
+    probs = counts.astype(np.float64) / float(labels.shape[0])
+    return float(np.sum(probs * probs))
+
+
+def tppr_weighted_label_purity(sym_tppr: csr_matrix, labels: np.ndarray) -> List[Dict]:
+    sym_tppr = sym_tppr.tocsr()
+    same_label_mass = 0.0
+    cross_label_mass = 0.0
+    total_mass = 0.0
+    nonself_nnz = 0
+    for node_id in range(labels.shape[0]):
+        start, end = sym_tppr.indptr[node_id], sym_tppr.indptr[node_id + 1]
+        neigh = sym_tppr.indices[start:end]
+        weights = sym_tppr.data[start:end].astype(np.float64, copy=False)
+        keep = neigh != node_id
+        neigh = neigh[keep]
+        weights = weights[keep]
+        if neigh.size == 0:
+            continue
+        same_mask = labels[neigh] == labels[node_id]
+        same_label_mass += float(weights[same_mask].sum())
+        cross_label_mass += float(weights[~same_mask].sum())
+        total_mass += float(weights.sum())
+        nonself_nnz += int(neigh.size)
+    purity = safe_div(same_label_mass, total_mass)
+    leakage = 1.0 - purity if not math.isnan(purity) else float("nan")
+    return [
+        {
+            "affinity_type": "symmetrized_pi",
+            "nonself_nnz": int(nonself_nnz),
+            "same_label_mass": same_label_mass,
+            "cross_label_mass": cross_label_mass,
+            "total_mass": total_mass,
+            "tppr_weighted_purity": purity,
+            "tppr_weighted_leakage": leakage,
+            "random_same_label_baseline": label_random_baseline(labels),
+        }
+    ]
+
+
 def experiment_edge_label_purity(multiplicity: Counter, labels: np.ndarray) -> List[Dict]:
     bucket_order = ["count=1", "count=2-3", "count=4-10", "count>10"]
     stats = {bucket: {"edge_count": 0, "same_label_edge_count": 0} for bucket in bucket_order}
@@ -561,6 +603,7 @@ def main():
         rng=rng,
     )
     directed_rows = experiment_directed_vs_symmetric(tppr, sym_tppr, labels, topk_values)
+    weighted_tppr_rows = tppr_weighted_label_purity(sym_tppr, labels)
     pair_rows, cn_freq_rows, cn_degree_rows = experiment_cross_label_sources(
         sym_tppr=sym_tppr,
         adjacency=adjacency,
@@ -581,6 +624,7 @@ def main():
         "tppr_directed_vs_symmetric_purity.csv": os.path.join(
             args.output_dir, "tppr_directed_vs_symmetric_purity.csv"
         ),
+        "tppr_weighted_label_purity.csv": os.path.join(args.output_dir, "tppr_weighted_label_purity.csv"),
         "cross_label_top_tppr_pairs.csv": os.path.join(args.output_dir, "cross_label_top_tppr_pairs.csv"),
         "cross_label_common_neighbor_frequency.csv": os.path.join(
             args.output_dir, "cross_label_common_neighbor_frequency.csv"
@@ -605,6 +649,20 @@ def main():
         files["tppr_directed_vs_symmetric_purity.csv"],
         ["affinity_type", "K", "valid_node_count", "purity_at_k", "leakage_at_k"],
         directed_rows,
+    )
+    write_csv(
+        files["tppr_weighted_label_purity.csv"],
+        [
+            "affinity_type",
+            "nonself_nnz",
+            "same_label_mass",
+            "cross_label_mass",
+            "total_mass",
+            "tppr_weighted_purity",
+            "tppr_weighted_leakage",
+            "random_same_label_baseline",
+        ],
+        weighted_tppr_rows,
     )
     write_csv(
         files["cross_label_top_tppr_pairs.csv"],
@@ -643,6 +701,20 @@ def main():
         "Directed TPPR Vs Symmetric TPPR Purity": (
             directed_rows,
             ["affinity_type", "K", "valid_node_count", "purity_at_k", "leakage_at_k"],
+            None,
+        ),
+        "TPPR Weighted Label Purity": (
+            weighted_tppr_rows,
+            [
+                "affinity_type",
+                "nonself_nnz",
+                "same_label_mass",
+                "cross_label_mass",
+                "total_mass",
+                "tppr_weighted_purity",
+                "tppr_weighted_leakage",
+                "random_same_label_baseline",
+            ],
             None,
         ),
         "Cross-Label Common Neighbor Degree Summary": (

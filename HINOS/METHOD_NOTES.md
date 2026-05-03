@@ -27,6 +27,8 @@ The split is intentional:
 
 `loss_assign_penalty` in metrics is the TGC KL term. `loss_hinos_bal` is the HINOS penalty term. Legacy `rho_assign` and `lambda_bal` remain only for compatibility with old commands.
 
+`L_TPPR-Cut` uses the raw symmetrized TPPR graph. The previous full-null degree-corrected trace variant was removed because, under row-stochastic \(Q\), its correction reduces to the constant shift \(\gamma(1-K)\) and does not change the optimization direction. The later edge-level residual variant was also removed after ablation because it changed cut values but did not materially change NMI or assignment entropy. See `docs/degree_aware_tppr_cut.md`.
+
 ## Assignment
 
 For the main method, use:
