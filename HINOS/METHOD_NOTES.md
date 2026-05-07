@@ -72,7 +72,7 @@ q_prime = StudentT(Zt_B, C)
 L_TGC-KL = KL(P || q_prime)
 ```
 
-The implementation uses `F.kl_div(log(q_prime), P.detach(), reduction="batchmean")`. `target_update_interval` is kept only for command compatibility and does not control the main `dynamic_tgc` path. `kl_target_mode=fixed_initial` is kept only as an ablation of the previous fixed-prior experiment.
+The implementation uses `F.kl_div(log(q_prime), P.detach(), reduction="batchmean")`. `target_update_interval` is kept only for command compatibility and does not control the main `dynamic_tgc` path.
 
 ## HINOS Balance
 

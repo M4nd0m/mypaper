@@ -1,0 +1,3 @@
+| dataset | metrics_csv | nmi_argmax_Q | acc_argmax_Q | nmi_spectral_pi | purity_at_5_pi | ncut_gt_pi | ncut_pred_pi | ncut_pred_over_gt_pi | spec_gap_c | spec_gap_c1 | spec_gap_ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| school | C:\Users\29792\Desktop\importantdata\科研\mypaper\HINOS\emb\school\school_TGC_1_smoke_phase0_metrics.csv | 0.9936408944250048 | 0.9969418960244648 | 0.15012059876450556 | 0.34633027522935766 | 4.0451077960543795 | 2.2000606450883074e-16 | 5.438818335654033e-17 | -8.545182680336846e-16 | -7.25367258726638e-16 | -0.0008551385575450025 |

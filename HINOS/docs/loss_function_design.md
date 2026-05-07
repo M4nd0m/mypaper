@@ -142,7 +142,7 @@ The full-graph current assignment
 Q=\operatorname{StudentT}(Z^t,C)
 \]
 
-is still used by TPPR-Cut, HINOS-Bal, and `argmax_s`. `target_update_interval` is retained only for command compatibility. `kl_target_mode fixed_initial` keeps the previous fixed-prior target only as an ablation.
+is still used by TPPR-Cut, HINOS-Bal, and `argmax_s`. `target_update_interval` is retained only for command compatibility.
 
 ## 4. TPPR-Cut
 

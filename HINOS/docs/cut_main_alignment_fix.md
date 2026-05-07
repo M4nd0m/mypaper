@@ -28,15 +28,9 @@ The final prediction for `cut_main` remains:
 \hat y_i=\arg\max_k S_{ik}.
 \]
 
-## What Changed From The Fixed-Prior Experiment
+## KL Target Path
 
-The previous fixed-prior repair used a target \(P_0\) built from initial node2vec features and initial KMeans centers. That path is preserved only as an ablation:
-
-```bash
---kl_target_mode fixed_initial
-```
-
-The main path now uses dynamic TGC target refresh:
+The fixed-prior KL path has been removed. The main path uses dynamic TGC target refresh:
 
 ```bash
 --kl_target_mode dynamic_tgc
@@ -107,12 +101,12 @@ python main.py --help
 
 Run smoke tests and experiments on the GPU server.
 
-## Fixed-Prior Ablation
+## DBLP Low-Cost Run
 
-The fixed-prior DBLP ablation is still available through:
+The DBLP low-cost run is available through:
 
 ```bash
 bash run_dblp_fixed_prior_lowcost.sh
 ```
 
-That script explicitly sets `--kl_target_mode fixed_initial`.
+That script uses `--kl_target_mode dynamic_tgc`.

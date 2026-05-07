@@ -172,6 +172,9 @@ class TimeAwarePathSparsifier:
             self.r_values = [1]
             self.r_cum = [1.0]
 
+    def _sample_start_edge(self) -> EdgePair:
+        return self.edges_static[self.rng.randint(self.m)]
+
     def _time_aware_next(self, x: int, t_ref: int):
         nbrs = self.tadj.get(x, {})
         if not nbrs:
@@ -179,7 +182,8 @@ class TimeAwarePathSparsifier:
         weights, candidates, chosen_tau = [], [], []
         for y, times in nbrs.items():
             tau_star = min(times, key=lambda tt: abs(tt - t_ref))
-            weights.append(1.0 / (abs(tau_star - t_ref) + self.tau_eps))
+            weight = 1.0 / (abs(tau_star - t_ref) + self.tau_eps)
+            weights.append(weight)
             candidates.append(y)
             chosen_tau.append(tau_star)
         total_weight = sum(weights)
@@ -243,7 +247,7 @@ class TimeAwarePathSparsifier:
 
         accum = {}
         for _ in range(self.N):
-            u, v = self.edges_static[self.rng.randint(self.m)]
+            u, v = self._sample_start_edge()
             r = self._sample_r()
             n0, nr, Zp_path = self._path_sampling((u, v), r)
             w = (2.0 * r * self.m) / (self.N * Zp_path)
@@ -270,7 +274,7 @@ def taps_cache_config(args, tadj_list):
     taps_N, static_edges, num_nodes = taps_budget(args, tadj_list)
     budget_mode = getattr(args, "taps_budget_mode", "sqrt_edges")
     budget_beta = float(getattr(args, "taps_budget_beta", 1.0))
-    return {
+    cfg = {
         "alpha": float(args.taps_alpha),
         "N_mode": str(budget_mode),
         "taps_budget_mode": str(budget_mode),
@@ -283,9 +287,16 @@ def taps_cache_config(args, tadj_list):
         "rng": int(args.taps_rng_seed),
         "Tcap": int(args.taps_T_cap) if int(args.taps_T_cap) > 0 else -1,
     }
+    return cfg
 
 
-def compute_taps_cached(file_path: str, args, dataset: str, tadj_list=None, T_total=None) -> csr_matrix:
+def compute_taps_cached(
+    file_path: str,
+    args,
+    dataset: str,
+    tadj_list=None,
+    T_total=None,
+) -> csr_matrix:
     if tadj_list is None or T_total is None:
         edges_uvt = read_temporal_edges(file_path)
         tadj_list, T_total = compress_time_indices(edges_uvt)
@@ -309,7 +320,14 @@ def compute_taps_cached(file_path: str, args, dataset: str, tadj_list=None, T_to
     return A_time.tocsr()
 
 
-def compute_tppr_cached(file_path: str, num_nodes: int, args, dataset: str, tadj_list=None, T_total=None) -> csr_matrix:
+def compute_tppr_cached(
+    file_path: str,
+    num_nodes: int,
+    args,
+    dataset: str,
+    tadj_list=None,
+    T_total=None,
+) -> csr_matrix:
     if tadj_list is None or T_total is None:
         edges_uvt = read_temporal_edges(file_path)
         tadj_list, T_total = compress_time_indices(edges_uvt)
@@ -322,7 +340,13 @@ def compute_tppr_cached(file_path: str, num_nodes: int, args, dataset: str, tadj
     if os.path.exists(taps_path):
         A_time = load_npz(taps_path).tocsr()
     else:
-        A_time = compute_taps_cached(file_path, args, dataset, tadj_list=tadj_list, T_total=T_total)
+        A_time = compute_taps_cached(
+            file_path,
+            args,
+            dataset,
+            tadj_list=tadj_list,
+            T_total=T_total,
+        )
 
     A_time.eliminate_zeros()
     rows, cols = A_time.nonzero()

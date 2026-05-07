@@ -56,8 +56,14 @@ See [docs/loss_function_design.md](docs/loss_function_design.md) for the full fo
 - `--rho_bal`: weight for HINOS balance inside `L_com` (default `0.1`).
 - `--prototype_lr_scale`: prototype-center learning-rate multiplier (default `0.1`).
 - `--target_update_interval`: legacy compatibility option; `dynamic_tgc` now builds DTGC batch targets directly.
-- `--kl_target_mode`: `dynamic_tgc`, `fixed_initial`, or `none` (default `dynamic_tgc`).
+- `--kl_target_mode`: `dynamic_tgc` or `none` (default `dynamic_tgc`).
 - `--balance_mode`: `hinos` or `none` (default `hinos`).
+- `--taps_prior_mode`: `none` or `cluster_residual` (default `none`). `cluster_residual` biases TAPS next-hop sampling with the initial Student-t cluster prior.
+- `--taps_prior_eta`: residual mixing strength for the TAPS cluster prior. `0` recovers original TAPS; larger values trust the initial clustering more.
+- `--taps_prior_tau`: penalty strength for the squared distance between initial soft assignments.
+- `--taps_prior_start_eta`: residual mixing strength for start-edge sampling. `0` keeps uniform start-edge sampling.
+- `--taps_prior_start_tau`: penalty strength for start-edge sampling.
+- `--taps_prior_sharpen`: `1` uses DEC-style sharpened initial assignments as the sampling prior; `0` uses raw Student-t assignments.
 
 TPPR-Cut uses the raw symmetrized TPPR graph. The earlier full-null degree-corrected trace and edge-level residual variants were removed from the training path after ablations showed they changed loss values without improving the assignment trajectory.
 

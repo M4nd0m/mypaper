@@ -22,9 +22,8 @@ from clustering_utils import (
     spectral_cluster_affinity,
 )
 from data_load import TGCDataSet, compress_time_indices, read_temporal_edges
-from graph_diagnostics import diagnose_affinity, hard_partition_ncut, label_array
+from graph_diagnostics import hard_partition_ncut
 from sparsification import build_ncut_graph, compute_tppr_cached
-from sccd_unified import UnifiedSimilarity
 from utils import choose_device, ensure_dir
 
 
@@ -46,34 +45,21 @@ METRIC_COLUMNS = [
     "loss_total",
     "loss_tppr_cut",
     "loss_tppr_cut_raw",
-    "loss_assign_penalty",
-    "loss_hinos_bal",
     "loss_com",
     "loss_cut_base",
-    "loss_anchor",
     "loss_temp",
     "loss_batch",
+    "loss_ncut_orth",
     "weighted_com",
     "weighted_cut",
-    "weighted_kl",
-    "weighted_hinos_bal",
-    "weighted_anchor",
     "weighted_temp",
     "weighted_batch",
-    "rho_assign",
-    "rho_cut",
-    "rho_kl",
-    "rho_bal",
-    "rho_anchor",
-    "lambda_temp",
+    "weighted_ncut_orth",
     "lambda_com",
+    "lambda_ncut_orth",
     "effective_lambda_com",
-    "assign_mode",
     "prototype_alpha",
     "prototype_lr_scale",
-    "target_update_interval",
-    "target_mode",
-    "balance_mode",
     "cluster_volume",
     "cluster_volume_min",
     "cluster_volume_max",
@@ -99,12 +85,6 @@ METRIC_COLUMNS = [
     "nmi_spectral_topk_pi",
     "ari_spectral_topk_pi",
     "f1_spectral_topk_pi",
-    "delta_U_pi_fro",
-    "purity_at_5_W_U",
-    "ncut_gt_W_U",
-    "ncut_pred_W_U",
-    "ncut_pred_over_gt_W_U",
-    "nmi_spectral_W_U",
     "spec_gap_c",
     "spec_gap_c1",
     "spec_gap_ratio",
@@ -117,23 +97,13 @@ class TGCTrainer:
         self.dataset_name = args.dataset
         self.device = choose_device(args.device)
         self.objective_mode = args.objective_mode
-        self.warmup_epochs = int(args.warmup_epochs)
         self.eval_interval = int(args.eval_interval)
         self.spectral_topk = int(args.spectral_topk)
         self.seed = int(args.seed)
-        self.assign_mode = args.assign_mode
         self.prototype_alpha = float(args.prototype_alpha)
         self.main_pred_mode = args.main_pred_mode
-        self.batch_recon_mode = args.batch_recon_mode
-        self.pseudo_conf_threshold = float(args.pseudo_conf_threshold)
         self.freeze_prototypes = bool(args.freeze_prototypes)
         self.prototype_lr_scale = float(args.prototype_lr_scale)
-        self.target_update_interval = max(1, int(args.target_update_interval))
-        self.kl_target_mode = args.kl_target_mode
-        self.balance_mode = args.balance_mode
-        self.unified_mode = args.unified_mode
-        self.rho_anchor = float(args.rho_anchor)
-        self.log_unified_align = bool(int(args.log_unified_align))
 
         self.file_path = os.path.join(args.data_root, self.dataset_name, f"{self.dataset_name}.txt")
         self.label_path = os.path.join(args.data_root, self.dataset_name, "node2label.txt")
@@ -159,6 +129,7 @@ class TGCTrainer:
         self.feature = self.data.get_feature().astype(np.float32)
         self.labels = read_node_labels(self.label_path) if os.path.exists(self.label_path) else None
         self.num_clusters = self._resolve_num_clusters(int(args.num_clusters))
+        self.args.resolved_num_clusters = int(self.num_clusters)
 
         self.node_emb = nn.Parameter(torch.from_numpy(self.feature).float().to(self.device))
         self.pre_emb = torch.from_numpy(self.feature).float().to(self.device)
@@ -167,34 +138,16 @@ class TGCTrainer:
         edges_uvt = read_temporal_edges(self.file_path)
         self.tadj_list, self.T_total = compress_time_indices(edges_uvt)
 
-        emb_dim = self.feature.shape[1]
-        self.cluster_mlp = nn.Sequential(
-            nn.Linear(emb_dim, args.cluster_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(args.cluster_hidden_dim, self.num_clusters),
-        ).to(self.device)
-        self.cluster_prototypes = None
         self.initial_cluster_centers = KMeans(
             n_clusters=self.num_clusters,
             n_init=10,
             random_state=self.seed,
         ).fit(self.feature).cluster_centers_.astype(np.float32)
         self.initial_cluster_centers_tensor = torch.from_numpy(self.initial_cluster_centers).float().to(self.device)
-        if self.assign_mode == "prototype":
-            self.cluster_prototypes = nn.Parameter(torch.from_numpy(self.initial_cluster_centers).float().to(self.device))
+        self.cluster_prototypes = nn.Parameter(torch.from_numpy(self.initial_cluster_centers).float().to(self.device))
 
         self.lambda_com = float(args.lambda_com)
-        self.rho_assign = float(args.rho_assign)
-        self.rho_cut = float(args.rho_cut)
-        self.rho_kl = float(args.rho_kl)
-        self.rho_bal = float(args.rho_bal)
-        self.lambda_cut = self.lambda_com
-        self.lambda_temp = float(args.lambda_temp)
-        self.lambda_batch = float(args.lambda_batch)
-        self.lambda_bal = float(args.lambda_bal)
-        self.com_ramp_epochs = int(args.com_ramp_epochs)
-        self.assignment_target: Optional[torch.Tensor] = None
-        self.assignment_target_epoch = -1
+        self.lambda_ncut_orth = float(args.lambda_ncut_orth) if args.lambda_ncut_orth is not None else 0.0
 
         self.tppr_mat = compute_tppr_cached(
             self.file_path,
@@ -210,16 +163,10 @@ class TGCTrainer:
         self.ncut_graph_csr.sort_indices()
         self.pi_cut_csr = self.ncut_graph_csr
         self.K = int(self.num_clusters)
+        self.eyeK = torch.eye(self.K, device=self.device)
+        self.old_ncut_orth_target = self.eyeK / math.sqrt(float(self.K))
         self._prepare_full_ncut_tensors()
-        self.unified_similarity: Optional[UnifiedSimilarity] = None
-        if self.unified_mode == "on":
-            self.unified_similarity = UnifiedSimilarity(
-                self.pi_cut_csr,
-                init_mode=args.U_init_mode,
-                device=self.device,
-            ).to(self.device)
         self.tppr_label_diagnostics = self._compute_tppr_label_diagnostics()
-        self._prepare_fixed_assignment_prior_target()
 
         self.neg_size = int(args.neg_size)
         self.hist_len = int(args.hist_len)
@@ -228,27 +175,20 @@ class TGCTrainer:
         self.num_workers = int(args.num_workers)
 
         params = [{"params": [self.node_emb, self.delta], "lr": args.learning_rate}]
-        if self.assign_mode == "prototype":
-            if not self.freeze_prototypes:
-                params.append(
-                    {
-                        "params": [self.cluster_prototypes],
-                        "lr": args.learning_rate * self.prototype_lr_scale,
-                    }
-                )
-        else:
-            params.append({"params": self.cluster_mlp.parameters(), "lr": args.learning_rate})
-        if self.unified_similarity is not None:
-            params.append({"params": self.unified_similarity.parameters(), "lr": args.learning_rate})
+        if not self.freeze_prototypes:
+            params.append(
+                {
+                    "params": [self.cluster_prototypes],
+                    "lr": args.learning_rate * self.prototype_lr_scale,
+                }
+            )
         self.opt = Adam(params=params)
 
         self.static_predictions: Dict[str, Optional[np.ndarray]] = {}
         self._init_metrics_csv()
         print(f"[Device] resolved        = {self.device}")
-        print(f"[Assign] target_mode     = {self.kl_target_mode}")
-        print(f"[Balance] mode           = {self.balance_mode}")
-        print(f"[Unified] mode           = {self.unified_mode}")
-        print(f"[Assign] freeze_proto    = {self.freeze_prototypes if self.assign_mode == 'prototype' else 'n/a'}")
+        print(f"[Assign] mode            = prototype")
+        print(f"[Assign] freeze_proto    = {self.freeze_prototypes}")
         print(
             "[TPPR Diag] "
             f"purity@10={self.tppr_label_diagnostics['purity_at_10_pi']:.4f} "
@@ -281,12 +221,6 @@ class TGCTrainer:
         degree = np.asarray(self.pi_cut_csr.sum(axis=1)).ravel().astype(np.float32)
         self.full_ncut_degree = torch.from_numpy(degree).to(self.device)
         self.pi_cut_degree = self.full_ncut_degree
-        degree_sum = float(degree.sum())
-        if degree_sum > 1e-6:
-            degree_prob = degree / (degree_sum + 1e-6)
-        else:
-            degree_prob = np.full((self.node_dim,), 1.0 / max(1, self.node_dim), dtype=np.float32)
-        self.degree_prob = torch.from_numpy(degree_prob.astype(np.float32)).to(self.device)
         self.sqrt_pi_cut_degree = torch.sqrt(self.full_ncut_degree.clamp_min(0.0))
         self.two_m_pi = torch.clamp(self.full_ncut_degree.sum(), min=1e-6)
 
@@ -373,40 +307,8 @@ class TGCTrainer:
         diag["ncut_gt_pi"] = self._compute_gt_ncut_pi(labels)
         return diag
 
-    def _prepare_fixed_assignment_prior_target(self) -> None:
-        eps = 1e-6
-        degree = np.asarray(self.pi_cut_csr.sum(axis=1)).ravel().astype(np.float32)
-        degree_sum = float(degree.sum())
-        if degree_sum > eps:
-            degree_prob = degree / (degree_sum + eps)
-        else:
-            degree_prob = np.full((self.node_dim,), 1.0 / max(1, self.node_dim), dtype=np.float32)
-
-        alpha = max(self.prototype_alpha, eps)
-        z0 = self.feature.astype(np.float32)
-        centers = self.initial_cluster_centers.astype(np.float32)
-        dist = ((z0[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        q0 = np.power(1.0 + dist / alpha, -((alpha + 1.0) / 2.0))
-        q0 = q0 / (q0.sum(axis=1, keepdims=True) + eps)
-
-        f0 = (degree_prob[:, None] * q0).sum(axis=0)
-        target = (q0 ** 2) / (f0[None, :] + eps)
-        target = target / (target.sum(axis=1, keepdims=True) + eps)
-
-        self.fixed_assignment_prior_target = torch.from_numpy(target.astype(np.float32)).to(self.device)
-
     def _assignment(self) -> torch.Tensor:
-        if self.assign_mode == "prototype":
-            return self._prototype_assignment()
-        return F.softmax(self.cluster_mlp(self.node_emb), dim=1)
-
-    def _prototype_assignment(self) -> torch.Tensor:
-        return self._student_t_assignment(self.node_emb, self._kl_cluster_centers())
-
-    def _kl_cluster_centers(self) -> torch.Tensor:
-        if self.cluster_prototypes is not None:
-            return self.cluster_prototypes
-        return self.initial_cluster_centers_tensor
+        return self._student_t_assignment(self.node_emb, self.cluster_prototypes)
 
     def _student_t_assignment(self, emb: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
         eps = 1e-6
@@ -416,253 +318,115 @@ class TGCTrainer:
         q = q.clamp_min(eps)
         return q / q.sum(dim=1, keepdim=True).clamp_min(eps)
 
-    def _compute_tgc_target(self, assign: torch.Tensor) -> torch.Tensor:
-        eps = 1e-6
-        freq = assign.sum(dim=0, keepdim=True)
-        target = assign.pow(2) / (freq + eps)
-        target = target.clamp_min(eps)
-        return target / target.sum(dim=1, keepdim=True).clamp_min(eps)
-
-    def _compute_dtgc_batch_kl(self, s_nodes: torch.Tensor) -> torch.Tensor:
-        if self.kl_target_mode == "none":
-            return torch.tensor(0.0, device=self.device)
-
-        centers = self._kl_cluster_centers()
-        current_emb = self.node_emb.index_select(0, s_nodes.view(-1))
-        q_prime = self._student_t_assignment(current_emb, centers)
-
-        if self.kl_target_mode == "fixed_initial":
-            target = self.fixed_assignment_prior_target.index_select(0, s_nodes.view(-1))
-        else:
-            with torch.no_grad():
-                pre_emb = self.pre_emb.index_select(0, s_nodes.view(-1))
-                q0 = self._student_t_assignment(pre_emb, centers)
-                target = self._compute_tgc_target(q0)
-
-        target = target.detach().clamp_min(1e-6)
-        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        q_prime = q_prime.clamp_min(1e-6)
-        q_prime = q_prime / q_prime.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        return F.kl_div(q_prime.log(), target, reduction="batchmean")
-
-    def _maybe_update_assignment_target(self, assign: torch.Tensor, epoch_idx: int) -> Optional[torch.Tensor]:
-        if self.kl_target_mode == "none":
-            return None
-        if self.kl_target_mode == "fixed_initial":
-            return self.fixed_assignment_prior_target
-        should_update = (
-            self.assignment_target is None
-            or self.assignment_target_epoch < 0
-            or epoch_idx % self.target_update_interval == 0
-        )
-        if should_update:
-            self.assignment_target = self._compute_tgc_target(assign).detach()
-            self.assignment_target_epoch = int(epoch_idx)
-        return self.assignment_target
-
-    def _compute_assignment_kl(self, assign: torch.Tensor, epoch_idx: int) -> torch.Tensor:
-        eps = 1e-6
-        target = self._maybe_update_assignment_target(assign, epoch_idx)
-        if target is None:
-            return torch.tensor(0.0, device=self.device)
-        assign_safe = assign.clamp_min(eps)
-        if self.kl_target_mode == "fixed_initial":
-            return (self.degree_prob.unsqueeze(1) * target * torch.log((target + eps) / assign_safe)).sum()
-        return (target * torch.log((target + eps) / assign_safe)).sum()
-
     def _fixed_graph_bundle(self) -> Dict[str, torch.Tensor]:
         return {
             "edge_i": self.full_ncut_edge_i,
             "edge_j": self.full_ncut_edge_j,
             "edge_w": self.full_ncut_edge_w,
             "degree": self.full_ncut_degree,
-            "two_m": self.two_m_pi,
-            "sqrt_degree": self.sqrt_pi_cut_degree,
-            "u_data": None,
         }
 
-    def _current_graph_bundle(self) -> Dict[str, torch.Tensor]:
-        if self.unified_similarity is None:
-            return self._fixed_graph_bundle()
-        graph = self.unified_similarity()
+    def _compute_search_ncut(self, assign: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        graph = self._fixed_graph_bundle()
+        edge_i = graph["edge_i"]
+        edge_j = graph["edge_j"]
+        edge_w = graph["edge_w"]
         degree = graph["degree"]
-        graph["two_m"] = torch.clamp(degree.sum(), min=1e-6)
-        graph["sqrt_degree"] = torch.sqrt(degree.clamp_min(0.0))
-        return graph
-
-    def _compute_anchor_loss(self, graph: Dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.unified_similarity is None or graph.get("u_data") is None:
-            return torch.tensor(0.0, device=self.device)
-        return self.unified_similarity.anchor_loss(graph["u_data"])
-
-    def _compute_hinos_balance(
-        self,
-        assign: torch.Tensor,
-        sqrt_degree: Optional[torch.Tensor] = None,
-        two_m: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if self.balance_mode == "none" or self.K <= 1:
-            return torch.tensor(0.0, device=self.device)
-        eps = 1e-6
-        sqrt_k = math.sqrt(float(self.K))
-        sqrt_degree = self.sqrt_pi_cut_degree if sqrt_degree is None else sqrt_degree
-        two_m = self.two_m_pi if two_m is None else two_m
-        weighted_assign = assign * sqrt_degree.unsqueeze(1)
-        sum_norms = torch.linalg.norm(weighted_assign, dim=0).sum()
-        ratio = sum_norms / (torch.sqrt(two_m) + eps)
-        penalty = (sqrt_k - ratio) / max(sqrt_k - 1.0, eps)
-        return penalty.clamp_min(0.0)
-
-    def _compute_cut(
-        self,
-        assign: torch.Tensor,
-        edge_i: torch.Tensor,
-        edge_j: torch.Tensor,
-        edge_w: torch.Tensor,
-        degree: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        eps = 1e-6
         zero = torch.tensor(0.0, device=self.device)
         if edge_i.numel() == 0:
-            return zero, {"loss_tppr_cut_raw": 0.0}
+            return zero, zero, zero
 
+        eps = 1e-6
         delta = assign.index_select(0, edge_i) - assign.index_select(0, edge_j)
         l_mat = delta.t().mm(edge_w.unsqueeze(1) * delta)
         g_mat = assign.t().mm(degree.unsqueeze(1) * assign)
-        loss_tppr_cut = torch.trace(torch.linalg.solve(g_mat + eps * torch.eye(self.K, device=self.device), l_mat))
-        return loss_tppr_cut.squeeze(), {
-            "loss_tppr_cut_raw": float(loss_tppr_cut.detach().item()),
-        }
+        cut = torch.trace(torch.linalg.solve(g_mat + eps * self.eyeK, l_mat)) / (float(self.K) + 1e-12)
+        fro = torch.linalg.norm(g_mat, ord="fro") + eps
+        orth = torch.linalg.norm(g_mat / fro - self.old_ncut_orth_target, ord="fro")
+        ncut = cut + self.lambda_ncut_orth * orth
+        return ncut.squeeze(), cut.squeeze(), orth.squeeze()
 
-    def _compute_tppr_cut(self, assign: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
-        graph = self._fixed_graph_bundle()
-        return self._compute_cut(assign, graph["edge_i"], graph["edge_j"], graph["edge_w"], graph["degree"])
+    def _loss_phase(self, epoch_idx: int) -> str:
+        return self.objective_mode
 
-    def _compute_community_terms(
-        self, assign: torch.Tensor, epoch_idx: int, loss_assign_penalty: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+    def _compute_search_proto_loss_terms(
+        self,
+        s_nodes: torch.Tensor,
+        t_nodes: torch.Tensor,
+        t_times: torch.Tensor,
+        n_nodes: torch.Tensor,
+        h_nodes: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        num_batches: int = 1,
+    ) -> Dict[str, object]:
+        batch = s_nodes.size(0)
+        s_node_emb = self.node_emb.index_select(0, s_nodes.view(-1)).view(batch, -1)
+        t_node_emb = self.node_emb.index_select(0, t_nodes.view(-1)).view(batch, -1)
+        h_node_emb = self.node_emb.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, -1)
+        n_node_emb = self.node_emb.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, -1)
+
+        assign = self._assignment()
         eps = 1e-6
-        graph = self._current_graph_bundle()
-        degree = graph["degree"]
+
+        new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
+        res_st_loss = torch.norm(1.0 - new_st_adj, p=2, dim=0)
+        new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
+        new_sh_adj = new_sh_adj * h_time_mask
+        new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
+        res_sh_loss = torch.norm(1.0 - new_sh_adj, p=2, dim=0).sum(dim=0)
+        res_sn_loss = torch.norm(new_sn_adj, p=2, dim=0).sum(dim=0)
+        l_rec = (res_st_loss + res_sh_loss + res_sn_loss) / max(1, batch)
+
+        att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
+        p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
+        p_alpha = ((h_node_emb - t_node_emb.unsqueeze(1)) ** 2).sum(dim=2).neg()
+        delta = self.delta.index_select(0, s_nodes.view(-1)).unsqueeze(1)
+        d_time = torch.abs(t_times.unsqueeze(1) - h_times)
+        p_lambda = p_mu + (att * p_alpha * torch.exp(delta * d_time) * h_time_mask).sum(dim=1)
+
+        n_mu = ((s_node_emb.unsqueeze(1) - n_node_emb) ** 2).sum(dim=2).neg()
+        n_alpha = ((h_node_emb.unsqueeze(2) - n_node_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
+        time_decay = torch.exp(delta * d_time).unsqueeze(2)
+        n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * time_decay * h_time_mask.unsqueeze(2)).sum(dim=1)
+        loss_pair = -torch.log(p_lambda.sigmoid() + eps) - torch.log(n_lambda.neg().sigmoid() + eps).sum(dim=1)
+        l_temp = loss_pair.mean()
+
+        l_ncut, l_cut_base, l_ncut_orth = self._compute_search_ncut(assign)
+        weighted_com = self.lambda_com * l_ncut
+        loss_total = l_rec + l_temp + weighted_com
+
+        degree = self.full_ncut_degree
         cluster_mass = assign.sum(dim=0)
         cluster_volume = assign.t().mm(degree.unsqueeze(1)).squeeze(1)
         volume_prob = cluster_volume / (cluster_volume.sum() + eps)
         assignment_entropy = -(assign * torch.log(assign + eps)).sum(dim=1).mean()
+        weighted_ncut_orth = self.lambda_com * self.lambda_ncut_orth * l_ncut_orth
 
-        l_assign = (
-            loss_assign_penalty
-            if loss_assign_penalty is not None
-            else self._compute_assignment_kl(assign, epoch_idx)
-        )
-        l_hinos_bal = self._compute_hinos_balance(assign, graph["sqrt_degree"], graph["two_m"])
-        l_anchor = self._compute_anchor_loss(graph)
-
-        if graph["edge_i"].numel() == 0:
-            zero = torch.tensor(0.0, device=self.device)
-            l_com = self.rho_kl * l_assign + self.rho_bal * l_hinos_bal + self.rho_anchor * l_anchor
-            return zero, l_assign.squeeze(), l_hinos_bal.squeeze(), l_anchor.squeeze(), l_com.squeeze(), {
-                "cluster_mass": cluster_mass.detach().cpu().numpy(),
-                "cluster_volume": cluster_volume.detach().cpu().numpy(),
-                "cluster_volume_min": float(cluster_volume.min().item()),
-                "cluster_volume_max": float(cluster_volume.max().item()),
-                "cluster_volume_entropy": float((-(volume_prob * torch.log(volume_prob + eps)).sum()).item()),
-                "assignment_entropy": float(assignment_entropy.item()),
-                "loss_tppr_cut_raw": 0.0,
-                "loss_anchor": float(l_anchor.detach().item()),
-                "delta_U_pi_fro": self.unified_similarity.delta_fro(graph["u_data"]) if self.unified_similarity else 0.0,
-            }
-
-        l_tppr_cut, cut_stats = self._compute_cut(
-            assign,
-            graph["edge_i"],
-            graph["edge_j"],
-            graph["edge_w"],
-            degree,
-        )
-        l_com = self.rho_cut * l_tppr_cut + self.rho_kl * l_assign + self.rho_bal * l_hinos_bal + self.rho_anchor * l_anchor
-
-        com_stats = {
+        return {
+            "phase": self.objective_mode,
+            "effective_lambda_com": self.lambda_com,
+            "loss_total": loss_total,
+            "loss_tppr_cut": l_cut_base,
+            "loss_tppr_cut_raw": float(l_cut_base.detach().item()),
+            "loss_com": l_ncut,
+            "loss_cut_base": l_cut_base,
+            "loss_temp": l_temp,
+            "loss_batch": l_rec,
+            "loss_ncut_orth": l_ncut_orth,
+            "weighted_com": weighted_com,
+            "weighted_cut_base": self.lambda_com * l_cut_base,
+            "weighted_cut": self.lambda_com * l_cut_base,
+            "weighted_temp": l_temp,
+            "weighted_batch": l_rec,
+            "weighted_ncut_orth": weighted_ncut_orth,
             "cluster_mass": cluster_mass.detach().cpu().numpy(),
             "cluster_volume": cluster_volume.detach().cpu().numpy(),
             "cluster_volume_min": float(cluster_volume.min().item()),
             "cluster_volume_max": float(cluster_volume.max().item()),
             "cluster_volume_entropy": float((-(volume_prob * torch.log(volume_prob + eps)).sum()).item()),
             "assignment_entropy": float(assignment_entropy.item()),
-            "loss_tppr_cut_raw": cut_stats["loss_tppr_cut_raw"],
-            "loss_anchor": float(l_anchor.detach().item()),
-            "delta_U_pi_fro": self.unified_similarity.delta_fro(graph["u_data"]) if self.unified_similarity else 0.0,
         }
-        return l_tppr_cut.squeeze(), l_assign.squeeze(), l_hinos_bal.squeeze(), l_anchor.squeeze(), l_com.squeeze(), com_stats
-
-    def _loss_phase(self, epoch_idx: int) -> str:
-        if self.objective_mode == "cut_main" and epoch_idx < self.warmup_epochs:
-            return "warmup"
-        return self.objective_mode
-
-    def _effective_lambda_com(self, epoch_idx: int) -> float:
-        if self.objective_mode != "cut_main":
-            return self.lambda_com
-        if epoch_idx < self.warmup_epochs:
-            return 0.0
-        progress = float(epoch_idx + 1 - self.warmup_epochs) / float(max(1, self.com_ramp_epochs))
-        return self.lambda_com * min(1.0, max(0.0, progress))
-
-    def _community_reconstruction_targets(
-        self,
-        assign: torch.Tensor,
-        s_nodes: torch.Tensor,
-        t_nodes: torch.Tensor,
-        h_nodes: torch.Tensor,
-        h_time_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch = s_nodes.size(0)
-        s_assign = assign.index_select(0, s_nodes)
-        t_assign = assign.index_select(0, t_nodes)
-
-        if self.batch_recon_mode == "ones":
-            target_st = torch.ones(batch, device=assign.device, dtype=assign.dtype)
-            target_sh = torch.ones_like(h_time_mask, dtype=assign.dtype)
-            mask_st = torch.ones_like(target_st)
-            mask_sh = h_time_mask.to(dtype=assign.dtype)
-        elif self.batch_recon_mode == "hard_pseudo":
-            s_label = s_assign.argmax(dim=1)
-            t_label = t_assign.argmax(dim=1)
-            target_st = (s_label == t_label).to(assign.dtype)
-            h_label = assign.index_select(0, h_nodes.view(-1)).argmax(dim=1).view(batch, self.hist_len)
-            target_sh = (s_label.unsqueeze(1) == h_label).to(assign.dtype)
-            mask_st = torch.ones_like(target_st)
-            mask_sh = h_time_mask.to(dtype=assign.dtype)
-        elif self.batch_recon_mode == "hard_pseudo_gate":
-            s_prob, s_label = s_assign.max(dim=1)
-            t_prob, t_label = t_assign.max(dim=1)
-            h_assign = assign.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, self.K)
-            h_prob, h_label = h_assign.max(dim=2)
-            conf = self.pseudo_conf_threshold
-
-            mask_st = (
-                (s_label == t_label) & (s_prob > conf) & (t_prob > conf)
-            ).to(assign.dtype).detach()
-            mask_sh = (
-                (s_label.unsqueeze(1) == h_label)
-                & (s_prob.unsqueeze(1) > conf)
-                & (h_prob > conf)
-            ).to(assign.dtype).detach() * h_time_mask.to(dtype=assign.dtype)
-            target_st = torch.ones_like(mask_st)
-            target_sh = torch.ones_like(mask_sh)
-        elif self.batch_recon_mode == "soft_pseudo":
-            target_st = (s_assign * t_assign).sum(dim=1)
-            h_assign = assign.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, self.K)
-            target_sh = (s_assign.unsqueeze(1) * h_assign).sum(dim=2)
-            mask_st = torch.ones_like(target_st)
-            mask_sh = h_time_mask.to(dtype=assign.dtype)
-        else:
-            raise ValueError(f"Unknown batch_recon_mode: {self.batch_recon_mode}")
-
-        target_st = target_st.clamp(0.0, 1.0).detach()
-        target_sh = target_sh.clamp(0.0, 1.0).detach()
-        mask_st = mask_st.detach()
-        mask_sh = mask_sh.detach()
-        return target_st, target_sh, mask_st, mask_sh
 
     def compute_loss_terms(
         self,
@@ -676,104 +440,16 @@ class TGCTrainer:
         epoch_idx: int,
         num_batches: int = 1,
     ) -> Dict[str, object]:
-        batch = s_nodes.size(0)
-
-        s_node_emb = self.node_emb.index_select(0, s_nodes.view(-1)).view(batch, -1)
-        t_node_emb = self.node_emb.index_select(0, t_nodes.view(-1)).view(batch, -1)
-        h_node_emb = self.node_emb.index_select(0, h_nodes.view(-1)).view(batch, self.hist_len, -1)
-        n_node_emb = self.node_emb.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, -1)
-
-        assign = self._assignment()
-        target_st, target_sh, mask_st, mask_sh = self._community_reconstruction_targets(
-            assign, s_nodes, t_nodes, h_nodes, h_time_mask
+        return self._compute_search_proto_loss_terms(
+            s_nodes,
+            t_nodes,
+            t_times,
+            n_nodes,
+            h_nodes,
+            h_times,
+            h_time_mask,
+            num_batches=num_batches,
         )
-
-        new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
-        new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
-        new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
-
-        eps = 1e-6
-        l_batch_pos = ((new_st_adj - target_st).pow(2) * mask_st).sum() / (mask_st.sum() + eps)
-        l_batch_hist = ((new_sh_adj - target_sh).pow(2) * mask_sh).sum() / (mask_sh.sum() + eps)
-        l_batch_neg = new_sn_adj.pow(2).mean()
-        l_batch = l_batch_pos + l_batch_hist + l_batch_neg
-
-        att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
-        p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
-        p_alpha = ((h_node_emb - t_node_emb.unsqueeze(1)) ** 2).sum(dim=2).neg()
-        delta = self.delta.index_select(0, s_nodes.view(-1)).unsqueeze(1)
-        delta_pos = F.softplus(delta)
-        d_time = torch.abs(t_times.unsqueeze(1) - h_times)
-        p_lambda = p_mu + (att * p_alpha * torch.exp(-delta_pos * d_time) * h_time_mask).sum(dim=1)
-
-        n_mu = ((s_node_emb.unsqueeze(1) - n_node_emb) ** 2).sum(dim=2).neg()
-        n_alpha = ((h_node_emb.unsqueeze(2) - n_node_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
-        time_decay = torch.exp(-delta_pos * d_time).unsqueeze(2)
-        n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * time_decay * h_time_mask.unsqueeze(2)).sum(dim=1)
-
-        loss_pair = -torch.log(p_lambda.sigmoid() + 1e-6) - torch.log(n_lambda.neg().sigmoid() + 1e-6).sum(dim=1)
-        l_temp = loss_pair.mean()
-
-        l_assign = self._compute_dtgc_batch_kl(s_nodes)
-        l_tppr_cut, l_assign, l_hinos_bal, l_anchor, l_com, com_stats = self._compute_community_terms(
-            assign, epoch_idx, loss_assign_penalty=l_assign
-        )
-
-        phase = self._loss_phase(epoch_idx)
-        effective_lambda_com = self._effective_lambda_com(epoch_idx)
-        if phase == "warmup":
-            weighted_com = torch.zeros_like(l_com)
-            weighted_cut = torch.zeros_like(l_tppr_cut)
-            weighted_temp = self.lambda_temp * l_temp
-            weighted_batch = self.lambda_batch * l_batch
-            weighted_assign = torch.zeros_like(l_assign)
-            weighted_hinos_bal = torch.zeros_like(l_hinos_bal)
-            weighted_bal = weighted_hinos_bal
-            weighted_anchor = torch.zeros_like(l_com)
-        else:
-            effective_lambda_com_batch = effective_lambda_com / max(1, num_batches)
-            weighted_com = effective_lambda_com_batch * l_com
-            weighted_cut = effective_lambda_com_batch * self.rho_cut * l_tppr_cut
-            weighted_temp = self.lambda_temp * l_temp
-            weighted_batch = self.lambda_batch * l_batch
-            weighted_assign = effective_lambda_com_batch * self.rho_kl * l_assign
-            weighted_hinos_bal = effective_lambda_com_batch * self.rho_bal * l_hinos_bal
-            weighted_bal = weighted_hinos_bal
-            weighted_anchor = effective_lambda_com_batch * self.rho_anchor * l_anchor
-
-        loss_total = weighted_temp + weighted_com + weighted_batch
-        return {
-            "phase": phase,
-            "effective_lambda_com": effective_lambda_com,
-            "loss_total": loss_total,
-            "loss_tppr_cut": l_tppr_cut,
-            "loss_tppr_cut_raw": com_stats["loss_tppr_cut_raw"],
-            "loss_assign_penalty": l_assign,
-            "loss_hinos_bal": l_hinos_bal,
-            "loss_com": l_com,
-            "loss_cut_base": l_tppr_cut,
-            "loss_anchor": l_anchor,
-            "loss_temp": l_temp,
-            "loss_batch": l_batch,
-            "loss_bal": l_hinos_bal,
-            "weighted_com": weighted_com,
-            "weighted_assign_penalty": weighted_assign,
-            "weighted_kl": weighted_assign,
-            "weighted_cut_base": weighted_cut,
-            "weighted_cut": weighted_cut,
-            "weighted_hinos_bal": weighted_hinos_bal,
-            "weighted_anchor": weighted_anchor,
-            "weighted_temp": weighted_temp,
-            "weighted_batch": weighted_batch,
-            "weighted_bal": weighted_bal,
-            "cluster_mass": com_stats["cluster_mass"],
-            "cluster_volume": com_stats["cluster_volume"],
-            "cluster_volume_min": com_stats["cluster_volume_min"],
-            "cluster_volume_max": com_stats["cluster_volume_max"],
-            "cluster_volume_entropy": com_stats["cluster_volume_entropy"],
-            "assignment_entropy": com_stats["assignment_entropy"],
-            "delta_U_pi_fro": com_stats["delta_U_pi_fro"],
-        }
 
     def _sample_to_device(self, sample: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, ...]:
         return (
@@ -795,43 +471,29 @@ class TGCTrainer:
             "loss_total": float(loss_terms["loss_total"].item()),
             "loss_tppr_cut": float(loss_terms["loss_tppr_cut"].item()),
             "loss_tppr_cut_raw": float(loss_terms["loss_tppr_cut_raw"]),
-            "loss_assign_penalty": float(loss_terms["loss_assign_penalty"].item()),
-            "loss_hinos_bal": float(loss_terms["loss_hinos_bal"].item()),
             "loss_com": float(loss_terms["loss_com"].item()),
             "loss_cut_base": float(loss_terms["loss_cut_base"].item()),
-            "loss_anchor": float(loss_terms["loss_anchor"].item()),
             "loss_temp": float(loss_terms["loss_temp"].item()),
             "loss_batch": float(loss_terms["loss_batch"].item()),
-            "loss_bal": float(loss_terms["loss_bal"].item()),
+            "loss_ncut_orth": float(loss_terms["loss_ncut_orth"].item()),
             "effective_lambda_com": float(loss_terms["effective_lambda_com"]),
             "weighted_com": float(loss_terms["weighted_com"].item()),
-            "weighted_assign_penalty": float(loss_terms["weighted_assign_penalty"].item()),
-            "weighted_kl": float(loss_terms["weighted_kl"].item()),
             "weighted_cut_base": float(loss_terms["weighted_cut_base"].item()),
             "weighted_cut": float(loss_terms["weighted_cut"].item()),
-            "weighted_hinos_bal": float(loss_terms["weighted_hinos_bal"].item()),
-            "weighted_anchor": float(loss_terms["weighted_anchor"].item()),
             "weighted_temp": float(loss_terms["weighted_temp"].item()),
             "weighted_batch": float(loss_terms["weighted_batch"].item()),
-            "weighted_bal": float(loss_terms["weighted_bal"].item()),
+            "weighted_ncut_orth": float(loss_terms["weighted_ncut_orth"].item()),
             "cluster_mass": np.asarray(loss_terms["cluster_mass"], dtype=np.float64),
             "cluster_volume": np.asarray(loss_terms["cluster_volume"], dtype=np.float64),
             "cluster_volume_min": float(loss_terms["cluster_volume_min"]),
             "cluster_volume_max": float(loss_terms["cluster_volume_max"]),
             "cluster_volume_entropy": float(loss_terms["cluster_volume_entropy"]),
             "assignment_entropy": float(loss_terms["assignment_entropy"]),
-            "delta_U_pi_fro": float(loss_terms["delta_U_pi_fro"]),
         }
 
     def _grad_norm(self) -> float:
         total = 0.0
-        params = [self.node_emb, self.delta]
-        if self.assign_mode == "prototype":
-            params.append(self.cluster_prototypes)
-        else:
-            params.extend(self.cluster_mlp.parameters())
-        if self.unified_similarity is not None:
-            params.extend(self.unified_similarity.parameters())
+        params = [self.node_emb, self.delta, self.cluster_prototypes]
         for param in params:
             if param.grad is None:
                 continue
@@ -841,12 +503,11 @@ class TGCTrainer:
     def compute_gradient_diagnostics(
         self, probe_batch: Tuple[torch.Tensor, ...], epoch_idx: int, num_batches: int = 1
     ) -> Dict[str, float]:
-        grad_norms = {"grad_norm_cut": 0.0, "grad_norm_temp": 0.0, "grad_norm_batch": 0.0, "grad_norm_bal": 0.0}
+        grad_norms = {"grad_norm_cut": 0.0, "grad_norm_temp": 0.0, "grad_norm_batch": 0.0}
         component_map = {
             "grad_norm_cut": "weighted_cut",
             "grad_norm_temp": "weighted_temp",
             "grad_norm_batch": "weighted_batch",
-            "grad_norm_bal": "weighted_bal",
         }
         for out_name, term_name in component_map.items():
             self.opt.zero_grad()
@@ -926,45 +587,26 @@ class TGCTrainer:
             "loss_total": epoch_stats["loss_total"],
             "loss_tppr_cut": epoch_stats["loss_tppr_cut"],
             "loss_tppr_cut_raw": epoch_stats["loss_tppr_cut_raw"],
-            "loss_assign_penalty": epoch_stats["loss_assign_penalty"],
-            "loss_hinos_bal": epoch_stats["loss_hinos_bal"],
             "loss_com": epoch_stats["loss_com"],
             "loss_cut_base": epoch_stats["loss_cut_base"],
-            "loss_anchor": epoch_stats.get("loss_anchor", 0.0),
             "loss_temp": epoch_stats["loss_temp"],
             "loss_batch": epoch_stats["loss_batch"],
+            "loss_ncut_orth": epoch_stats.get("loss_ncut_orth", 0.0),
             "weighted_com": epoch_stats["weighted_com"],
             "weighted_cut": epoch_stats["weighted_cut"],
-            "weighted_kl": epoch_stats["weighted_kl"],
-            "weighted_hinos_bal": epoch_stats["weighted_hinos_bal"],
-            "weighted_anchor": epoch_stats.get("weighted_anchor", 0.0),
             "weighted_temp": epoch_stats["weighted_temp"],
             "weighted_batch": epoch_stats["weighted_batch"],
-            "rho_assign": self.rho_assign,
-            "rho_cut": self.rho_cut,
-            "rho_kl": self.rho_kl,
-            "rho_bal": self.rho_bal,
-            "rho_anchor": self.rho_anchor,
-            "lambda_temp": self.lambda_temp,
+            "weighted_ncut_orth": epoch_stats.get("weighted_ncut_orth", 0.0),
             "lambda_com": self.lambda_com,
+            "lambda_ncut_orth": self.lambda_ncut_orth,
             "effective_lambda_com": epoch_stats["effective_lambda_com"],
-            "assign_mode": self.assign_mode,
             "prototype_alpha": self.prototype_alpha,
             "prototype_lr_scale": self.prototype_lr_scale,
-            "target_update_interval": self.target_update_interval,
-            "target_mode": self.kl_target_mode,
-            "balance_mode": self.balance_mode,
             "cluster_volume": epoch_stats["cluster_volume"],
             "cluster_volume_min": epoch_stats["cluster_volume_min"],
             "cluster_volume_max": epoch_stats["cluster_volume_max"],
             "cluster_volume_entropy": epoch_stats["cluster_volume_entropy"],
             "assignment_entropy": epoch_stats["assignment_entropy"],
-            "delta_U_pi_fro": epoch_stats.get("delta_U_pi_fro", 0.0),
-            "purity_at_5_W_U": float("nan"),
-            "ncut_gt_W_U": float("nan"),
-            "ncut_pred_W_U": float("nan"),
-            "ncut_pred_over_gt_W_U": float("nan"),
-            "nmi_spectral_W_U": float("nan"),
             "spec_gap_c": float("nan"),
             "spec_gap_c1": float("nan"),
             "spec_gap_ratio": float("nan"),
@@ -978,46 +620,10 @@ class TGCTrainer:
             metric_row[f"ari_{prefix}"] = metrics["ARI"]
             metric_row[f"f1_{prefix}"] = metrics["F1"]
 
-        if self.unified_similarity is not None and self.log_unified_align:
-            labels = label_array(self.labels, self.node_dim)
-            W_u = self.unified_similarity.to_scipy()
-            u_diag = diagnose_affinity(
-                W_u,
-                labels,
-                self.K,
-                random_state=self.seed,
-                topk=None,
-                prefix="W_U",
-                compute_spectral=True,
-                compute_gap=True,
-            )
-            metric_row["purity_at_5_W_U"] = u_diag.get("purity_at_5_W_U", float("nan"))
-            metric_row["ncut_gt_W_U"] = u_diag.get("ncut_gt_W_U", float("nan"))
-            metric_row["ncut_pred_W_U"] = u_diag.get("ncut_pred_W_U", float("nan"))
-            metric_row["ncut_pred_over_gt_W_U"] = u_diag.get("ncut_pred_over_gt_W_U", float("nan"))
-            metric_row["nmi_spectral_W_U"] = u_diag.get("nmi_spectral_W_U", float("nan"))
-            metric_row["spec_gap_c"] = u_diag.get("spec_gap_c", float("nan"))
-            metric_row["spec_gap_c1"] = u_diag.get("spec_gap_c1", float("nan"))
-            metric_row["spec_gap_ratio"] = u_diag.get("spec_gap_ratio", float("nan"))
-        elif self.log_unified_align:
-            labels = label_array(self.labels, self.node_dim)
-            pi_diag = diagnose_affinity(
-                self.pi_cut_csr,
-                labels,
-                self.K,
-                random_state=self.seed,
-                topk=None,
-                prefix="pi",
-                compute_spectral=False,
-                compute_gap=True,
-            )
-            metric_row["spec_gap_c"] = pi_diag.get("spec_gap_c", float("nan"))
-            metric_row["spec_gap_c1"] = pi_diag.get("spec_gap_c1", float("nan"))
-            metric_row["spec_gap_ratio"] = pi_diag.get("spec_gap_ratio", float("nan"))
-            if labels is not None and predictions.get("spectral_pi") is not None:
-                ncut_pred_pi = hard_partition_ncut(self.pi_cut_csr, predictions["spectral_pi"])
-                metric_row["ncut_pred_pi"] = ncut_pred_pi
-                metric_row["ncut_pred_over_gt_pi"] = ncut_pred_pi / (metric_row["ncut_gt_pi"] + 1e-12)
+        if self.labels is not None and predictions.get("spectral_pi") is not None:
+            ncut_pred_pi = hard_partition_ncut(self.pi_cut_csr, predictions["spectral_pi"])
+            metric_row["ncut_pred_pi"] = ncut_pred_pi
+            metric_row["ncut_pred_over_gt_pi"] = ncut_pred_pi / (metric_row["ncut_gt_pi"] + 1e-12)
 
         with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as writer_file:
             writer = csv.DictWriter(writer_file, fieldnames=METRIC_COLUMNS)
@@ -1027,9 +633,8 @@ class TGCTrainer:
         print(
             f"[Eval] epoch={epoch_num} phase={metric_row['phase']} "
             f"loss_total={metric_row['loss_total']:.4f} loss_tppr_cut={metric_row['loss_tppr_cut']:.4f} "
-            f"loss_kl={metric_row['loss_assign_penalty']:.4f} "
-            f"loss_hinos_bal={metric_row['loss_hinos_bal']:.4f} "
             f"loss_com={metric_row['loss_com']:.4f} "
+            f"loss_ncut_orth={metric_row['loss_ncut_orth']:.4f} "
             f"loss_temp={metric_row['loss_temp']:.4f} loss_batch={metric_row['loss_batch']:.4f} "
             f"effective_lambda_com={metric_row['effective_lambda_com']:.4f} "
             f"vol_min={metric_row['cluster_volume_min']:.4f} "
@@ -1058,30 +663,22 @@ class TGCTrainer:
                 "loss_total": 0.0,
                 "loss_tppr_cut": 0.0,
                 "loss_tppr_cut_raw": 0.0,
-                "loss_assign_penalty": 0.0,
-                "loss_hinos_bal": 0.0,
                 "loss_com": 0.0,
                 "loss_cut_base": 0.0,
-                "loss_anchor": 0.0,
                 "loss_temp": 0.0,
                 "loss_batch": 0.0,
-                "loss_bal": 0.0,
+                "loss_ncut_orth": 0.0,
                 "effective_lambda_com": 0.0,
                 "weighted_com": 0.0,
-                "weighted_assign_penalty": 0.0,
-                "weighted_kl": 0.0,
                 "weighted_cut_base": 0.0,
                 "weighted_cut": 0.0,
-                "weighted_hinos_bal": 0.0,
-                "weighted_anchor": 0.0,
                 "weighted_temp": 0.0,
                 "weighted_batch": 0.0,
-                "weighted_bal": 0.0,
+                "weighted_ncut_orth": 0.0,
                 "cluster_volume_min": 0.0,
                 "cluster_volume_max": 0.0,
                 "cluster_volume_entropy": 0.0,
                 "assignment_entropy": 0.0,
-                "delta_U_pi_fro": 0.0,
             }
             final_cluster_mass = None
             final_cluster_volume = None
@@ -1118,8 +715,7 @@ class TGCTrainer:
                 f"effective_lambda_com={epoch_avgs['effective_lambda_com']:.4f} "
                 f"loss_total={epoch_avgs['loss_total']:.4f} "
                 f"loss_com={epoch_avgs['loss_com']:.4f} "
-                f"loss_kl={epoch_avgs['loss_assign_penalty']:.4f} "
-                f"loss_hinos_bal={epoch_avgs['loss_hinos_bal']:.4f} "
+                f"loss_ncut_orth={epoch_avgs['loss_ncut_orth']:.4f} "
                 f"loss_temp={epoch_avgs['loss_temp']:.4f} "
                 f"loss_batch={epoch_avgs['loss_batch']:.4f} "
                 f"vol_min={epoch_avgs['cluster_volume_min']:.4f} "

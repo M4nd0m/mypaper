@@ -5,11 +5,14 @@ from trainer import TGCTrainer
 from utils import resolve_path, set_random_seed
 
 
+OBJECTIVE_MODE = "search_proto"
+
+
 def get_args():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
 
     parser = argparse.ArgumentParser(
-        description="Offline temporal community representation learning with adaptive TAPS, TPPR, and full-graph NCut."
+        description="Offline temporal community representation learning with TAPS, TPPR, and Student-t NCut."
     )
     parser.add_argument("-d", "--dataset", type=str, default="school", help="dataset name")
     parser.add_argument("--directed", type=int, default=0, help="whether to read the graph as directed")
@@ -54,24 +57,29 @@ def get_args():
     )
     parser.add_argument("--taps_budget_beta", type=float, default=1.0, help="dimensionless TAPS nlogn budget scale")
 
-    parser.add_argument("--objective_mode", type=str, default="original", choices=["original", "cut_main"])
     parser.add_argument(
-        "--assign_mode",
+        "--objective_mode",
         type=str,
-        default="prototype",
-        choices=["mlp", "prototype"],
-        help="soft assignment head",
+        default=OBJECTIVE_MODE,
+        choices=[OBJECTIVE_MODE],
+        help="fixed objective: HINOS4search-style rec/temp/NCut with Student-t prototype assignment",
     )
     parser.add_argument("--prototype_alpha", type=float, default=1.0, help="Student-t assignment alpha")
     parser.add_argument(
         "--freeze_prototypes",
         action="store_true",
-        help="freeze prototype centers after KMeans initialization when assign_mode=prototype",
+        help="freeze prototype centers after KMeans initialization",
+    )
+    parser.add_argument(
+        "--prototype_lr_scale",
+        type=float,
+        default=0.1,
+        help="learning-rate multiplier for Student-t prototype centers",
     )
     parser.add_argument(
         "--main_pred_mode",
         type=str,
-        default=None,
+        default="argmax_s",
         choices=["kmeans_z", "argmax_s", "kmeans_s", "spectral_pi", "spectral_topk_pi"],
         help="prediction method exported as the main *_pred.txt file",
     )
@@ -85,80 +93,11 @@ def get_args():
         help="legacy alias for --lambda_com",
     )
     parser.add_argument(
-        "--rho_assign",
+        "--lambda_ncut_orth",
         type=float,
         default=None,
-        help="legacy alias for --rho_kl",
+        help="old NCut orthogonality weight",
     )
-    parser.add_argument("--rho_cut", type=float, default=None, help="TPPR-Cut weight inside L_com")
-    parser.add_argument("--rho_kl", type=float, default=None, help="TGC dynamic KL weight inside L_com")
-    parser.add_argument("--rho_bal", type=float, default=None, help="HINOS balance penalty weight inside L_com")
-    parser.add_argument("--unified_mode", type=str, default="off", choices=["off", "on"], help="learn sparse TPPR-anchored U")
-    parser.add_argument("--rho_anchor", type=float, default=1.0, help="anchor weight for learned U")
-    parser.add_argument("--U_init_mode", type=str, default="log_pi", choices=["log_pi", "uniform"], help="sparse U initialization")
-    parser.add_argument(
-        "--log_unified_align",
-        type=int,
-        default=0,
-        help="log unified graph alignment diagnostics (spec_gap_*, nmi_spectral_W_U, etc); "
-        "default 0 keeps Phase 0 baseline free of new eval cost; pass 1 for Phase 1b",
-    )
-    parser.add_argument(
-        "--prototype_lr_scale",
-        type=float,
-        default=0.1,
-        help="learning-rate multiplier for Student-t prototype centers",
-    )
-    parser.add_argument(
-        "--target_update_interval",
-        type=int,
-        default=5,
-        help="legacy interval kept for compatibility; dynamic_tgc now uses DTGC batch targets",
-    )
-    parser.add_argument(
-        "--kl_target_mode",
-        type=str,
-        default="dynamic_tgc",
-        choices=["dynamic_tgc", "fixed_initial", "none"],
-        help="assignment target used by the KL term; dynamic_tgc follows DTGC batch-level target construction",
-    )
-    parser.add_argument(
-        "--balance_mode",
-        type=str,
-        default="hinos",
-        choices=["hinos", "none"],
-        help="balance/sharpness penalty used inside L_com",
-    )
-    parser.add_argument(
-        "--lambda_temp",
-        type=float,
-        default=None,
-        help="temporal loss weight",
-    )
-    parser.add_argument("--lambda_batch", type=float, default=None, help="batch reconstruction loss weight")
-    parser.add_argument(
-        "--batch_recon_mode",
-        type=str,
-        default=None,
-        choices=["ones", "soft_pseudo", "hard_pseudo", "hard_pseudo_gate"],
-        help="batch reconstruction target mode: ones is legacy; pseudo modes use stop-gradient assignments",
-    )
-    parser.add_argument(
-        "--pseudo_conf_threshold",
-        type=float,
-        default=0.7,
-        help="confidence threshold for hard_pseudo_gate batch reconstruction",
-    )
-    parser.add_argument(
-        "--lambda_bal",
-        type=float,
-        default=None,
-        help="legacy compatibility flag; does not add an extra loss term. Use --rho_assign for the assignment prior inside L_com",
-    )
-    parser.add_argument("--lambda_ncut_orth", type=float, default=None, help="legacy alias for balance weight")
-    parser.add_argument("--cluster_hidden_dim", type=int, default=64, help="cluster MLP hidden dimension")
-    parser.add_argument("--warmup_epochs", type=int, default=0, help="warmup epochs before cut_main")
-    parser.add_argument("--com_ramp_epochs", type=int, default=20, help="epochs used to ramp lambda_com after warmup")
     parser.add_argument("--eval_interval", type=int, default=0, help="evaluation interval; 0 means final epoch only")
     parser.add_argument("--spectral_topk", type=int, default=20, help="top-k sparsification for spectral Pi diagnostics")
     parser.add_argument("--run_tag", type=str, default="", help="optional suffix for output filenames")
@@ -166,50 +105,14 @@ def get_args():
 
 
 def apply_objective_defaults(args):
-    if args.lambda_bal is None and args.lambda_ncut_orth is not None:
-        args.lambda_bal = args.lambda_ncut_orth
     if args.lambda_com is None and args.lambda_community is not None:
         args.lambda_com = args.lambda_community
-    if args.lambda_community is None and args.lambda_com is not None:
-        args.lambda_community = args.lambda_com
+    if args.lambda_com is None:
+        args.lambda_com = 0.1
+    args.lambda_community = args.lambda_com
+    if args.lambda_ncut_orth is None:
+        args.lambda_ncut_orth = 100.0
 
-    if args.objective_mode == "cut_main":
-        if args.lambda_com is None:
-            args.lambda_com = 1.0
-        args.lambda_community = args.lambda_com
-        if args.lambda_temp is None:
-            args.lambda_temp = 0.01
-        if args.lambda_batch is None:
-            args.lambda_batch = 0.01
-        if args.lambda_bal is None:
-            args.lambda_bal = 0.0
-        if args.batch_recon_mode is None:
-            args.batch_recon_mode = "ones"
-    else:
-        if args.lambda_com is None:
-            args.lambda_com = 0.1
-        args.lambda_community = args.lambda_com
-        if args.lambda_temp is None:
-            args.lambda_temp = 1.0
-        if args.lambda_batch is None:
-            args.lambda_batch = 1.0
-        if args.lambda_bal is None:
-            args.lambda_bal = 0.0
-        if args.batch_recon_mode is None:
-            args.batch_recon_mode = "ones"
-    if args.rho_cut is None:
-        args.rho_cut = 1.0
-    if args.rho_kl is None:
-        args.rho_kl = args.rho_assign if args.rho_assign is not None else 1.0
-    if args.rho_bal is None:
-        args.rho_bal = args.lambda_bal if args.lambda_bal not in (None, 0.0) else 0.1
-    if args.rho_assign is None:
-        args.rho_assign = args.rho_kl
-    if args.main_pred_mode is None:
-        if args.objective_mode == "cut_main":
-            args.main_pred_mode = "argmax_s"
-        else:
-            args.main_pred_mode = "kmeans_z"
     return args
 
 
@@ -227,8 +130,6 @@ def main():
     print("\n==============================")
     print(f"[RUN] dataset            = {args.dataset}")
     print(f"[RUN] objective_mode     = {args.objective_mode}")
-    print(f"[RUN] warmup_epochs      = {args.warmup_epochs}")
-    print(f"[RUN] com_ramp_epochs    = {args.com_ramp_epochs}")
     print(f"[RUN] eval_interval      = {args.eval_interval if args.eval_interval > 0 else 'final-only'}")
     print(f"[Graph] directed         = {bool(args.directed)}")
     print(f"[Device] device          = {args.device}")
@@ -238,22 +139,15 @@ def main():
         f"budget_beta={args.taps_budget_beta}, tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
     )
     print(
-        f"[Loss] lambda_temp={args.lambda_temp}, lambda_com={args.lambda_com}, "
-        f"lambda_batch={args.lambda_batch}, rho_cut={args.rho_cut}, "
-        f"rho_kl={args.rho_kl}, rho_bal={args.rho_bal}, rho_anchor={args.rho_anchor}, "
-        f"legacy_rho_assign={args.rho_assign}, "
-        f"legacy_lambda_bal={args.lambda_bal} (diagnostic only)"
+        f"[Loss] lambda_com={args.lambda_com}, lambda_ncut_orth={args.lambda_ncut_orth}, "
+        "rec_weight=1.0, temp_weight=1.0, kl=off"
     )
-    print(f"[BatchRecon] mode={args.batch_recon_mode}")
     print(
-        f"[Assign] mode={args.assign_mode}, prototype_alpha={args.prototype_alpha}, "
+        f"[Assign] mode=prototype, prototype_alpha={args.prototype_alpha}, "
         f"prototype_lr_scale={args.prototype_lr_scale}, freeze_prototypes={args.freeze_prototypes}, "
-        f"target_mode={args.kl_target_mode}, target_update_interval={args.target_update_interval}, "
         f"main_pred={args.main_pred_mode}"
     )
-    print(f"[Balance] mode={args.balance_mode}")
-    print(f"[Unified] mode={args.unified_mode}, U_init={args.U_init_mode}, log_align={args.log_unified_align}")
-    print(f"[NCut] hidden_dim={args.cluster_hidden_dim}, spectral_topk={args.spectral_topk}, scope=full")
+    print(f"[NCut] spectral_topk={args.spectral_topk}, scope=fixed W_pi")
     print(f"[Cluster] num_clusters   = {args.num_clusters if args.num_clusters > 0 else 'auto-from-labels'}")
     print(f"[Path] data_root         = {args.data_root}")
     print(f"[Path] emb_root          = {args.emb_root}")
