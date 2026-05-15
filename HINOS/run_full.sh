@@ -6,6 +6,8 @@ LOG_DIR="${LOG_DIR:-logs/full}"
 RUN_PREFIX="${RUN_PREFIX:-search_proto}"
 RUN_EVAL="${RUN_EVAL:-0}"
 EPOCH_OVERRIDE="${EPOCH:-}"
+BATCH_RECON_MODE="${BATCH_RECON_MODE:-cebr}"
+CEBR_HIST_DECAY="${CEBR_HIST_DECAY:-0.1}"
 export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
 
 # Data4TGC-style datasets. The three very large arXiv variants are excluded
@@ -23,37 +25,37 @@ dataset_config() {
   local ds="$1"
   case "$ds" in
     school)
-      EPOCH_DEFAULT=40
+      EPOCH_DEFAULT=100
       TPPR_K=5
-      TAPS_BETA=0.7
+      TAPS_BETA=0.8
       EVAL_INTERVAL=5
       ;;
     dblp)
-      EPOCH_DEFAULT=40
+      EPOCH_DEFAULT=100
       TPPR_K=5
       TAPS_BETA=0.1
       EVAL_INTERVAL=5
       ;;
     brain)
-      EPOCH_DEFAULT=40
+      EPOCH_DEFAULT=100
       TPPR_K=5
       TAPS_BETA=0.2
       EVAL_INTERVAL=5
       ;;
     patent)
-      EPOCH_DEFAULT=40
+      EPOCH_DEFAULT=100
       TPPR_K=5
       TAPS_BETA=0.2
       EVAL_INTERVAL=5
       ;;
     arXivAI)
-      EPOCH_DEFAULT=25
+      EPOCH_DEFAULT=100
       TPPR_K=5
       TAPS_BETA=0.02
       EVAL_INTERVAL=5
       ;;
     arXivCS)
-      EPOCH_DEFAULT=20
+      EPOCH_DEFAULT=100
       TPPR_K=5
       TAPS_BETA=0.005
       EVAL_INTERVAL=5
@@ -69,13 +71,14 @@ dataset_config() {
 run_one() {
   local ds="$1"
   dataset_config "$ds"
-  local tag="${RUN_PREFIX}_${ds}_proto_k${TPPR_K}_b${TAPS_BETA}_e${EPOCH}"
+  local tag="${RUN_PREFIX}_${BATCH_RECON_MODE}_${ds}_proto_k${TPPR_K}_b${TAPS_BETA}_e${EPOCH}"
 
   {
     echo "============================================================"
     echo "[Full] start=$(date '+%Y-%m-%d %H:%M:%S') dataset=${ds}"
     echo "[Full] epoch=${EPOCH} tppr_K=${TPPR_K} taps_beta=${TAPS_BETA}"
-    echo "[Full] objective=search_proto assignment=prototype lambda_community=${LAMBDA_COMMUNITY:-0.1} lambda_ncut_orth=${LAMBDA_NCUT_ORTH:-100} kl=off"
+    echo "[Full] objective=search_proto assignment=prototype lambda_batch=${LAMBDA_BATCH:-1.0} lambda_ncut=${LAMBDA_NCUT:-0.5} lambda_ncut_orth=${LAMBDA_NCUT_ORTH:-5.0} kl=off"
+    echo "[Full] batch_recon_mode=${BATCH_RECON_MODE} cebr_hist_decay=${CEBR_HIST_DECAY}"
     echo "[Full] run_tag=${tag}"
     echo "============================================================"
 
@@ -85,8 +88,11 @@ run_one() {
       --epoch "$EPOCH" \
       --prototype_alpha 1.0 \
       --prototype_lr_scale 0.01 \
-      --lambda_community "${LAMBDA_COMMUNITY:-0.1}" \
-      --lambda_ncut_orth "${LAMBDA_NCUT_ORTH:-100}" \
+      --batch_recon_mode "$BATCH_RECON_MODE" \
+      --cebr_hist_decay "$CEBR_HIST_DECAY" \
+      --lambda_batch "${LAMBDA_BATCH:-1.0}" \
+      --lambda_ncut "${LAMBDA_NCUT:-0.5}" \
+      --lambda_ncut_orth "${LAMBDA_NCUT_ORTH:-5.0}" \
       --tppr_K "$TPPR_K" \
       --taps_budget_mode nlogn \
       --taps_budget_beta "$TAPS_BETA" \

@@ -31,39 +31,30 @@ METRIC_COLUMNS = [
     "epoch",
     "phase",
     "objective_mode",
-    "pi_asymmetry_norm",
-    "pi_cut_density",
     "purity_at_5_pi",
     "purity_at_10_pi",
     "purity_at_20_pi",
-    "leakage_at_5_pi",
-    "leakage_at_10_pi",
-    "leakage_at_20_pi",
     "ncut_gt_pi",
     "ncut_pred_pi",
     "ncut_pred_over_gt_pi",
     "loss_total",
     "loss_tppr_cut",
-    "loss_tppr_cut_raw",
     "loss_com",
-    "loss_cut_base",
+    "loss_ncut_orth",
     "loss_temp",
     "loss_batch",
-    "loss_ncut_orth",
-    "weighted_com",
-    "weighted_cut",
-    "weighted_temp",
-    "weighted_batch",
-    "weighted_ncut_orth",
-    "lambda_com",
+    "loss_cebr_evt",
+    "loss_cebr_his",
+    "loss_cebr_ce",
+    "mean_g_neg",
+    "mean_r_neg",
+    "lambda_batch",
+    "lambda_ncut",
     "lambda_ncut_orth",
-    "effective_lambda_com",
     "prototype_alpha",
     "prototype_lr_scale",
-    "cluster_volume",
     "cluster_volume_min",
     "cluster_volume_max",
-    "cluster_volume_entropy",
     "assignment_entropy",
     "acc_argmax_s",
     "nmi_argmax_s",
@@ -85,9 +76,6 @@ METRIC_COLUMNS = [
     "nmi_spectral_topk_pi",
     "ari_spectral_topk_pi",
     "f1_spectral_topk_pi",
-    "spec_gap_c",
-    "spec_gap_c1",
-    "spec_gap_ratio",
 ]
 
 
@@ -101,6 +89,8 @@ class TGCTrainer:
         self.spectral_topk = int(args.spectral_topk)
         self.seed = int(args.seed)
         self.prototype_alpha = float(args.prototype_alpha)
+        self.batch_recon_mode = args.batch_recon_mode
+        self.cebr_hist_decay = float(args.cebr_hist_decay)
         self.main_pred_mode = args.main_pred_mode
         self.freeze_prototypes = bool(args.freeze_prototypes)
         self.prototype_lr_scale = float(args.prototype_lr_scale)
@@ -146,9 +136,9 @@ class TGCTrainer:
         self.initial_cluster_centers_tensor = torch.from_numpy(self.initial_cluster_centers).float().to(self.device)
         self.cluster_prototypes = nn.Parameter(torch.from_numpy(self.initial_cluster_centers).float().to(self.device))
 
-        self.lambda_com = float(args.lambda_com)
-        self.lambda_ncut_orth = float(args.lambda_ncut_orth) if args.lambda_ncut_orth is not None else 0.0
-
+        self.lambda_batch = float(args.lambda_batch)
+        self.lambda_ncut = float(args.lambda_ncut)
+        self.lambda_ncut_orth = float(args.lambda_ncut_orth)
         self.tppr_mat = compute_tppr_cached(
             self.file_path,
             self.node_dim,
@@ -164,7 +154,7 @@ class TGCTrainer:
         self.pi_cut_csr = self.ncut_graph_csr
         self.K = int(self.num_clusters)
         self.eyeK = torch.eye(self.K, device=self.device)
-        self.old_ncut_orth_target = self.eyeK / math.sqrt(float(self.K))
+        self.orth_target = self.eyeK / math.sqrt(float(self.K))
         self._prepare_full_ncut_tensors()
         self.tppr_label_diagnostics = self._compute_tppr_label_diagnostics()
 
@@ -185,10 +175,17 @@ class TGCTrainer:
         self.opt = Adam(params=params)
 
         self.static_predictions: Dict[str, Optional[np.ndarray]] = {}
+        self.best_start_epoch = 10
+        self.best_epoch: Optional[int] = None
+        self.best_nmi = float("-inf")
+        self.best_metric_row: Optional[Dict[str, object]] = None
+        self.best_outputs_saved = False
         self._init_metrics_csv()
         print(f"[Device] resolved        = {self.device}")
         print(f"[Assign] mode            = prototype")
         print(f"[Assign] freeze_proto    = {self.freeze_prototypes}")
+        print(f"[BatchRecon] mode        = {self.batch_recon_mode}")
+        print(f"[BatchRecon] hist_decay  = {self.cebr_hist_decay}")
         print(
             "[TPPR Diag] "
             f"purity@10={self.tppr_label_diagnostics['purity_at_10_pi']:.4f} "
@@ -213,11 +210,14 @@ class TGCTrainer:
         return num_clusters
 
     def _prepare_full_ncut_tensors(self) -> None:
-        W = self.pi_cut_csr.tocoo()
-        mask = W.row < W.col
-        self.full_ncut_edge_i = torch.from_numpy(W.row[mask].astype(np.int64)).to(self.device)
-        self.full_ncut_edge_j = torch.from_numpy(W.col[mask].astype(np.int64)).to(self.device)
-        self.full_ncut_edge_w = torch.from_numpy(W.data[mask].astype(np.float32)).to(self.device)
+        W = self.pi_cut_csr.tocsr()
+        W.sum_duplicates()
+        W.eliminate_zeros()
+        crow = torch.from_numpy(W.indptr.astype(np.int64, copy=False)).to(self.device)
+        col = torch.from_numpy(W.indices.astype(np.int64, copy=False)).to(self.device)
+        val = torch.from_numpy(W.data.astype(np.float32, copy=False)).to(self.device)
+        self.full_ncut_w_sparse = torch.sparse_csr_tensor(crow, col, val, size=W.shape, device=self.device)
+        self.full_ncut_nnz = int(W.nnz)
         degree = np.asarray(self.pi_cut_csr.sum(axis=1)).ravel().astype(np.float32)
         self.full_ncut_degree = torch.from_numpy(degree).to(self.device)
         self.pi_cut_degree = self.full_ncut_degree
@@ -320,31 +320,101 @@ class TGCTrainer:
 
     def _fixed_graph_bundle(self) -> Dict[str, torch.Tensor]:
         return {
-            "edge_i": self.full_ncut_edge_i,
-            "edge_j": self.full_ncut_edge_j,
-            "edge_w": self.full_ncut_edge_w,
+            "w_sparse": self.full_ncut_w_sparse,
             "degree": self.full_ncut_degree,
         }
 
     def _compute_search_ncut(self, assign: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         graph = self._fixed_graph_bundle()
-        edge_i = graph["edge_i"]
-        edge_j = graph["edge_j"]
-        edge_w = graph["edge_w"]
+        w_sparse = graph["w_sparse"]
         degree = graph["degree"]
         zero = torch.tensor(0.0, device=self.device)
-        if edge_i.numel() == 0:
+        if self.full_ncut_nnz == 0:
             return zero, zero, zero
 
         eps = 1e-6
-        delta = assign.index_select(0, edge_i) - assign.index_select(0, edge_j)
-        l_mat = delta.t().mm(edge_w.unsqueeze(1) * delta)
-        g_mat = assign.t().mm(degree.unsqueeze(1) * assign)
+        dh = degree.unsqueeze(1) * assign
+        wh = torch.sparse.mm(w_sparse, assign)
+        l_mat = assign.t().mm(dh - wh)
+        g_mat = assign.t().mm(dh)
         cut = torch.trace(torch.linalg.solve(g_mat + eps * self.eyeK, l_mat)) / (float(self.K) + 1e-12)
         fro = torch.linalg.norm(g_mat, ord="fro") + eps
-        orth = torch.linalg.norm(g_mat / fro - self.old_ncut_orth_target, ord="fro")
+        orth = torch.linalg.norm(g_mat / fro - self.orth_target, ord="fro")
         ncut = cut + self.lambda_ncut_orth * orth
         return ncut.squeeze(), cut.squeeze(), orth.squeeze()
+
+    @staticmethod
+    def _normalized_cosine(x: torch.Tensor, y: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        return 0.5 * (1.0 + torch.cosine_similarity(x, y, dim=dim))
+
+    def _compute_batch_reconstruction(
+        self,
+        s_nodes: torch.Tensor,
+        n_nodes: torch.Tensor,
+        s_node_emb: torch.Tensor,
+        t_node_emb: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        n_node_emb: torch.Tensor,
+        t_times: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        assign: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch = s_nodes.size(0)
+        eps = 1e-6
+
+        if self.batch_recon_mode == "ones":
+            new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
+            res_st_loss = torch.norm(1.0 - new_st_adj, p=2, dim=0)
+            new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
+            new_sh_adj = new_sh_adj * h_time_mask
+            new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
+            res_sh_loss = torch.norm(1.0 - new_sh_adj, p=2, dim=0).sum(dim=0)
+            res_sn_loss = torch.norm(new_sn_adj, p=2, dim=0).sum(dim=0)
+            loss_evt = res_st_loss / max(1, batch)
+            loss_his = res_sh_loss / max(1, batch)
+            loss_ce = res_sn_loss / max(1, batch)
+            r_sn = 0.5 * (1.0 + new_sn_adj)
+            q_s = assign.index_select(0, s_nodes.view(-1))
+            q_n = assign.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, self.K)
+            g_sn = (q_s.unsqueeze(1) * q_n).sum(dim=2)
+            return {
+                "loss_batch": loss_evt + loss_his + loss_ce,
+                "loss_cebr_evt": loss_evt,
+                "loss_cebr_his": loss_his,
+                "loss_cebr_ce": loss_ce,
+                "mean_g_neg": g_sn.mean(),
+                "mean_r_neg": r_sn.mean(),
+            }
+
+        if self.batch_recon_mode != "cebr":
+            raise ValueError(f"Unsupported batch_recon_mode: {self.batch_recon_mode}")
+
+        r_st = self._normalized_cosine(s_node_emb, t_node_emb)
+        loss_evt = (1.0 - r_st).pow(2).mean()
+
+        r_sh = self._normalized_cosine(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
+        delta_t = torch.abs(t_times.unsqueeze(1) - h_times)
+        normalizer = max(float(getattr(self.data, "max_d_time", 1.0)), 1.0)
+        normalized_delta_t = delta_t / normalizer
+        hist_score = torch.exp(-self.cebr_hist_decay * normalized_delta_t) * h_time_mask
+        hist_weight = hist_score / hist_score.sum(dim=1, keepdim=True).clamp_min(eps)
+        loss_his = (hist_weight * (1.0 - r_sh).pow(2)).sum(dim=1).mean()
+
+        r_sn = self._normalized_cosine(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
+        q_s = assign.index_select(0, s_nodes.view(-1))
+        q_n = assign.index_select(0, n_nodes.view(-1)).view(batch, self.neg_size, self.K)
+        g_sn = (q_s.unsqueeze(1) * q_n).sum(dim=2)
+        loss_ce = (r_sn - g_sn).pow(2).mean()
+
+        return {
+            "loss_batch": loss_evt + loss_his + loss_ce,
+            "loss_cebr_evt": loss_evt,
+            "loss_cebr_his": loss_his,
+            "loss_cebr_ce": loss_ce,
+            "mean_g_neg": g_sn.mean(),
+            "mean_r_neg": r_sn.mean(),
+        }
 
     def _loss_phase(self, epoch_idx: int) -> str:
         return self.objective_mode
@@ -369,14 +439,19 @@ class TGCTrainer:
         assign = self._assignment()
         eps = 1e-6
 
-        new_st_adj = torch.cosine_similarity(s_node_emb, t_node_emb)
-        res_st_loss = torch.norm(1.0 - new_st_adj, p=2, dim=0)
-        new_sh_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), h_node_emb, dim=2)
-        new_sh_adj = new_sh_adj * h_time_mask
-        new_sn_adj = torch.cosine_similarity(s_node_emb.unsqueeze(1), n_node_emb, dim=2)
-        res_sh_loss = torch.norm(1.0 - new_sh_adj, p=2, dim=0).sum(dim=0)
-        res_sn_loss = torch.norm(new_sn_adj, p=2, dim=0).sum(dim=0)
-        l_rec = (res_st_loss + res_sh_loss + res_sn_loss) / max(1, batch)
+        batch_recon = self._compute_batch_reconstruction(
+            s_nodes,
+            n_nodes,
+            s_node_emb,
+            t_node_emb,
+            h_node_emb,
+            n_node_emb,
+            t_times,
+            h_times,
+            h_time_mask,
+            assign,
+        )
+        l_rec = batch_recon["loss_batch"]
 
         att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
         p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
@@ -393,33 +468,38 @@ class TGCTrainer:
         l_temp = loss_pair.mean()
 
         l_ncut, l_cut_base, l_ncut_orth = self._compute_search_ncut(assign)
-        weighted_com = self.lambda_com * l_ncut
-        loss_total = l_rec + l_temp + weighted_com
+        weighted_batch = self.lambda_batch * l_rec
+        weighted_ncut = self.lambda_ncut * l_ncut
+        loss_total = weighted_batch + l_temp + weighted_ncut
 
         degree = self.full_ncut_degree
         cluster_mass = assign.sum(dim=0)
         cluster_volume = assign.t().mm(degree.unsqueeze(1)).squeeze(1)
         volume_prob = cluster_volume / (cluster_volume.sum() + eps)
         assignment_entropy = -(assign * torch.log(assign + eps)).sum(dim=1).mean()
-        weighted_ncut_orth = self.lambda_com * self.lambda_ncut_orth * l_ncut_orth
 
         return {
             "phase": self.objective_mode,
-            "effective_lambda_com": self.lambda_com,
+            "effective_lambda_ncut": self.lambda_ncut,
             "loss_total": loss_total,
             "loss_tppr_cut": l_cut_base,
             "loss_tppr_cut_raw": float(l_cut_base.detach().item()),
             "loss_com": l_ncut,
             "loss_cut_base": l_cut_base,
+            "loss_ncut_orth": l_ncut_orth,
             "loss_temp": l_temp,
             "loss_batch": l_rec,
-            "loss_ncut_orth": l_ncut_orth,
-            "weighted_com": weighted_com,
-            "weighted_cut_base": self.lambda_com * l_cut_base,
-            "weighted_cut": self.lambda_com * l_cut_base,
+            "loss_cebr_evt": batch_recon["loss_cebr_evt"],
+            "loss_cebr_his": batch_recon["loss_cebr_his"],
+            "loss_cebr_ce": batch_recon["loss_cebr_ce"],
+            "mean_g_neg": float(batch_recon["mean_g_neg"].detach().item()),
+            "mean_r_neg": float(batch_recon["mean_r_neg"].detach().item()),
+            "weighted_ncut": weighted_ncut,
+            "weighted_cut_base": self.lambda_ncut * l_cut_base,
+            "weighted_cut": self.lambda_ncut * l_cut_base,
+            "weighted_ncut_orth": self.lambda_ncut * self.lambda_ncut_orth * l_ncut_orth,
             "weighted_temp": l_temp,
-            "weighted_batch": l_rec,
-            "weighted_ncut_orth": weighted_ncut_orth,
+            "weighted_batch": weighted_batch,
             "cluster_mass": cluster_mass.detach().cpu().numpy(),
             "cluster_volume": cluster_volume.detach().cpu().numpy(),
             "cluster_volume_min": float(cluster_volume.min().item()),
@@ -473,16 +553,21 @@ class TGCTrainer:
             "loss_tppr_cut_raw": float(loss_terms["loss_tppr_cut_raw"]),
             "loss_com": float(loss_terms["loss_com"].item()),
             "loss_cut_base": float(loss_terms["loss_cut_base"].item()),
+            "loss_ncut_orth": float(loss_terms["loss_ncut_orth"].item()),
             "loss_temp": float(loss_terms["loss_temp"].item()),
             "loss_batch": float(loss_terms["loss_batch"].item()),
-            "loss_ncut_orth": float(loss_terms["loss_ncut_orth"].item()),
-            "effective_lambda_com": float(loss_terms["effective_lambda_com"]),
-            "weighted_com": float(loss_terms["weighted_com"].item()),
+            "loss_cebr_evt": float(loss_terms["loss_cebr_evt"].item()),
+            "loss_cebr_his": float(loss_terms["loss_cebr_his"].item()),
+            "loss_cebr_ce": float(loss_terms["loss_cebr_ce"].item()),
+            "mean_g_neg": float(loss_terms["mean_g_neg"]),
+            "mean_r_neg": float(loss_terms["mean_r_neg"]),
+            "effective_lambda_ncut": float(loss_terms["effective_lambda_ncut"]),
+            "weighted_ncut": float(loss_terms["weighted_ncut"].item()),
             "weighted_cut_base": float(loss_terms["weighted_cut_base"].item()),
             "weighted_cut": float(loss_terms["weighted_cut"].item()),
+            "weighted_ncut_orth": float(loss_terms["weighted_ncut_orth"].item()),
             "weighted_temp": float(loss_terms["weighted_temp"].item()),
             "weighted_batch": float(loss_terms["weighted_batch"].item()),
-            "weighted_ncut_orth": float(loss_terms["weighted_ncut_orth"].item()),
             "cluster_mass": np.asarray(loss_terms["cluster_mass"], dtype=np.float64),
             "cluster_volume": np.asarray(loss_terms["cluster_volume"], dtype=np.float64),
             "cluster_volume_min": float(loss_terms["cluster_volume_min"]),
@@ -528,6 +613,15 @@ class TGCTrainer:
             for i in range(self.node_dim):
                 writer.write(str(i) + " " + " ".join(map(str, emb[i])) + "\n")
 
+    def _save_outputs(self, predictions: Dict[str, Optional[np.ndarray]], assign: np.ndarray) -> None:
+        main_pred = predictions[self.main_pred_mode]
+        if main_pred is None:
+            raise ValueError(f"Prediction mode {self.main_pred_mode} did not produce predictions.")
+        ensure_dir(os.path.dirname(self.pred_path))
+        save_prediction_file(self.pred_path, main_pred)
+        np.save(self.soft_assignment_path, assign)
+        self.save_node_embeddings(self.emb_path)
+
     def _static_predictions(self) -> Dict[str, Optional[np.ndarray]]:
         if self.static_predictions:
             return self.static_predictions
@@ -546,6 +640,91 @@ class TGCTrainer:
         y_pred = np.asarray(pred, dtype=np.int64)
         return compute_clustering_metrics(y_true, y_pred)
 
+    def _main_prediction(self, assign: np.ndarray, emb: Optional[np.ndarray] = None) -> np.ndarray:
+        if self.main_pred_mode == "argmax_s":
+            return np.argmax(assign, axis=1).astype(np.int64)
+        if self.main_pred_mode == "kmeans_s":
+            return kmeans_predict(assign, self.K, random_state=self.seed)
+        if self.main_pred_mode == "kmeans_z":
+            if emb is None:
+                emb = self.node_emb.detach().cpu().numpy().astype(np.float32)
+            return kmeans_predict(emb, self.K, random_state=self.seed)
+        if self.main_pred_mode == "spectral_pi":
+            return self._static_predictions()["spectral_pi"]
+        if self.main_pred_mode == "spectral_topk_pi":
+            return self._static_predictions()["spectral_topk_pi"]
+        raise ValueError(f"Unsupported main_pred_mode: {self.main_pred_mode}")
+
+    def _metric_row_template(self, epoch_num: int, epoch_stats: Dict[str, float]) -> Dict[str, object]:
+        metric_row = {column: float("nan") for column in METRIC_COLUMNS}
+        metric_row.update(
+            {
+                "epoch": int(epoch_num),
+                "phase": self._loss_phase(epoch_num - 1),
+                "objective_mode": self.objective_mode,
+                "loss_total": epoch_stats["loss_total"],
+                "loss_tppr_cut": epoch_stats["loss_tppr_cut"],
+                "loss_com": epoch_stats["loss_com"],
+                "loss_ncut_orth": epoch_stats.get("loss_ncut_orth", float("nan")),
+                "loss_temp": epoch_stats["loss_temp"],
+                "loss_batch": epoch_stats["loss_batch"],
+                "loss_cebr_evt": epoch_stats.get("loss_cebr_evt", float("nan")),
+                "loss_cebr_his": epoch_stats.get("loss_cebr_his", float("nan")),
+                "loss_cebr_ce": epoch_stats.get("loss_cebr_ce", float("nan")),
+                "mean_g_neg": epoch_stats.get("mean_g_neg", float("nan")),
+                "mean_r_neg": epoch_stats.get("mean_r_neg", float("nan")),
+                "lambda_batch": self.lambda_batch,
+                "lambda_ncut": self.lambda_ncut,
+                "lambda_ncut_orth": self.lambda_ncut_orth,
+                "prototype_alpha": self.prototype_alpha,
+                "prototype_lr_scale": self.prototype_lr_scale,
+                "cluster_volume_min": epoch_stats["cluster_volume_min"],
+                "cluster_volume_max": epoch_stats["cluster_volume_max"],
+                "assignment_entropy": epoch_stats["assignment_entropy"],
+            }
+        )
+        return metric_row
+
+    def evaluate_lightweight_and_log(
+        self,
+        epoch_num: int,
+        epoch_stats: Dict[str, float],
+    ) -> Dict[str, object]:
+        emb = self.node_emb.detach().cpu().numpy().astype(np.float32)
+        assign = self._assignment().detach().cpu().numpy().astype(np.float32)
+        predictions = {
+            "argmax_s": np.argmax(assign, axis=1).astype(np.int64),
+            "kmeans_z": kmeans_predict(emb, self.K, random_state=self.seed),
+            "kmeans_s": kmeans_predict(assign, self.K, random_state=self.seed),
+        }
+        if self.main_pred_mode not in predictions:
+            predictions[self.main_pred_mode] = self._main_prediction(assign, emb=emb)
+
+        metric_row = self._metric_row_template(epoch_num, epoch_stats)
+        for method, pred in predictions.items():
+            metrics = self._prediction_metrics(pred)
+            metric_row[f"acc_{method}"] = metrics["ACC"]
+            metric_row[f"nmi_{method}"] = metrics["NMI"]
+            metric_row[f"ari_{method}"] = metrics["ARI"]
+            metric_row[f"f1_{method}"] = metrics["F1"]
+
+        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as writer_file:
+            writer = csv.DictWriter(writer_file, fieldnames=METRIC_COLUMNS)
+            writer.writerow(metric_row)
+
+        print(
+            f"[Eval:light] epoch={epoch_num} {self.main_pred_mode}: "
+            f"ACC={metric_row[f'acc_{self.main_pred_mode}']:.4f} "
+            f"NMI={metric_row[f'nmi_{self.main_pred_mode}']:.4f} "
+            f"ARI={metric_row[f'ari_{self.main_pred_mode}']:.4f} "
+            f"F1={metric_row[f'f1_{self.main_pred_mode}']:.4f}"
+        )
+        return {
+            "predictions": predictions,
+            "assign": assign,
+            "metric_row": metric_row,
+        }
+
     def evaluate_and_log(
         self,
         epoch_num: int,
@@ -563,54 +742,17 @@ class TGCTrainer:
         predictions.update(self._static_predictions())
 
         if save_final:
-            main_pred = predictions[self.main_pred_mode]
-            ensure_dir(os.path.dirname(self.pred_path))
-            save_prediction_file(self.pred_path, main_pred)
-            np.save(self.soft_assignment_path, assign)
-            self.save_node_embeddings(self.emb_path)
+            self._save_outputs(predictions, assign)
 
-        metric_row = {
-            "epoch": int(epoch_num),
-            "phase": self._loss_phase(epoch_num - 1),
-            "objective_mode": self.objective_mode,
-            "pi_asymmetry_norm": self.pi_asymmetry_norm,
-            "pi_cut_density": self.pi_cut_density,
-            "purity_at_5_pi": self.tppr_label_diagnostics["purity_at_5_pi"],
-            "purity_at_10_pi": self.tppr_label_diagnostics["purity_at_10_pi"],
-            "purity_at_20_pi": self.tppr_label_diagnostics["purity_at_20_pi"],
-            "leakage_at_5_pi": self.tppr_label_diagnostics["leakage_at_5_pi"],
-            "leakage_at_10_pi": self.tppr_label_diagnostics["leakage_at_10_pi"],
-            "leakage_at_20_pi": self.tppr_label_diagnostics["leakage_at_20_pi"],
-            "ncut_gt_pi": self.tppr_label_diagnostics["ncut_gt_pi"],
-            "ncut_pred_pi": float("nan"),
-            "ncut_pred_over_gt_pi": float("nan"),
-            "loss_total": epoch_stats["loss_total"],
-            "loss_tppr_cut": epoch_stats["loss_tppr_cut"],
-            "loss_tppr_cut_raw": epoch_stats["loss_tppr_cut_raw"],
-            "loss_com": epoch_stats["loss_com"],
-            "loss_cut_base": epoch_stats["loss_cut_base"],
-            "loss_temp": epoch_stats["loss_temp"],
-            "loss_batch": epoch_stats["loss_batch"],
-            "loss_ncut_orth": epoch_stats.get("loss_ncut_orth", 0.0),
-            "weighted_com": epoch_stats["weighted_com"],
-            "weighted_cut": epoch_stats["weighted_cut"],
-            "weighted_temp": epoch_stats["weighted_temp"],
-            "weighted_batch": epoch_stats["weighted_batch"],
-            "weighted_ncut_orth": epoch_stats.get("weighted_ncut_orth", 0.0),
-            "lambda_com": self.lambda_com,
-            "lambda_ncut_orth": self.lambda_ncut_orth,
-            "effective_lambda_com": epoch_stats["effective_lambda_com"],
-            "prototype_alpha": self.prototype_alpha,
-            "prototype_lr_scale": self.prototype_lr_scale,
-            "cluster_volume": epoch_stats["cluster_volume"],
-            "cluster_volume_min": epoch_stats["cluster_volume_min"],
-            "cluster_volume_max": epoch_stats["cluster_volume_max"],
-            "cluster_volume_entropy": epoch_stats["cluster_volume_entropy"],
-            "assignment_entropy": epoch_stats["assignment_entropy"],
-            "spec_gap_c": float("nan"),
-            "spec_gap_c1": float("nan"),
-            "spec_gap_ratio": float("nan"),
-        }
+        metric_row = self._metric_row_template(epoch_num, epoch_stats)
+        metric_row.update(
+            {
+                "purity_at_5_pi": self.tppr_label_diagnostics["purity_at_5_pi"],
+                "purity_at_10_pi": self.tppr_label_diagnostics["purity_at_10_pi"],
+                "purity_at_20_pi": self.tppr_label_diagnostics["purity_at_20_pi"],
+                "ncut_gt_pi": self.tppr_label_diagnostics["ncut_gt_pi"],
+            }
+        )
 
         for method, pred in predictions.items():
             metrics = self._prediction_metrics(pred)
@@ -631,15 +773,8 @@ class TGCTrainer:
 
         main_method = self.main_pred_mode
         print(
-            f"[Eval] epoch={epoch_num} phase={metric_row['phase']} "
-            f"loss_total={metric_row['loss_total']:.4f} loss_tppr_cut={metric_row['loss_tppr_cut']:.4f} "
-            f"loss_com={metric_row['loss_com']:.4f} "
-            f"loss_ncut_orth={metric_row['loss_ncut_orth']:.4f} "
-            f"loss_temp={metric_row['loss_temp']:.4f} loss_batch={metric_row['loss_batch']:.4f} "
-            f"effective_lambda_com={metric_row['effective_lambda_com']:.4f} "
-            f"vol_min={metric_row['cluster_volume_min']:.4f} "
-            f"vol_max={metric_row['cluster_volume_max']:.4f} "
-            f"entropy={metric_row['assignment_entropy']:.4f} "
+            f"[Eval] epoch={epoch_num} "
+            f"loss={metric_row['loss_total']:.4f} "
             f"{main_method}: ACC={metric_row[f'acc_{main_method}']:.4f} "
             f"NMI={metric_row[f'nmi_{main_method}']:.4f} "
             f"ARI={metric_row[f'ari_{main_method}']:.4f} "
@@ -647,12 +782,14 @@ class TGCTrainer:
         )
         return {
             "predictions": predictions,
+            "assign": assign,
             "metric_row": metric_row,
         }
 
     def train(self) -> Dict[str, object]:
         total_start = time.time()
         last_eval = None
+        full_eval_interval = self.eval_interval if self.eval_interval > 0 else 5
 
         for epoch_idx in range(self.epochs):
             epoch_start = time.time()
@@ -665,16 +802,21 @@ class TGCTrainer:
                 "loss_tppr_cut_raw": 0.0,
                 "loss_com": 0.0,
                 "loss_cut_base": 0.0,
+                "loss_ncut_orth": 0.0,
                 "loss_temp": 0.0,
                 "loss_batch": 0.0,
-                "loss_ncut_orth": 0.0,
-                "effective_lambda_com": 0.0,
-                "weighted_com": 0.0,
+                "loss_cebr_evt": 0.0,
+                "loss_cebr_his": 0.0,
+                "loss_cebr_ce": 0.0,
+                "mean_g_neg": 0.0,
+                "mean_r_neg": 0.0,
+                "effective_lambda_ncut": 0.0,
+                "weighted_ncut": 0.0,
                 "weighted_cut_base": 0.0,
                 "weighted_cut": 0.0,
+                "weighted_ncut_orth": 0.0,
                 "weighted_temp": 0.0,
                 "weighted_batch": 0.0,
-                "weighted_ncut_orth": 0.0,
                 "cluster_volume_min": 0.0,
                 "cluster_volume_max": 0.0,
                 "cluster_volume_entropy": 0.0,
@@ -711,36 +853,61 @@ class TGCTrainer:
 
             print(
                 f"Epoch {epoch_idx + 1}/{self.epochs} finished in {epoch_time:.2f}s | "
-                f"phase={self._loss_phase(epoch_idx)} "
-                f"effective_lambda_com={epoch_avgs['effective_lambda_com']:.4f} "
                 f"loss_total={epoch_avgs['loss_total']:.4f} "
-                f"loss_com={epoch_avgs['loss_com']:.4f} "
-                f"loss_ncut_orth={epoch_avgs['loss_ncut_orth']:.4f} "
                 f"loss_temp={epoch_avgs['loss_temp']:.4f} "
                 f"loss_batch={epoch_avgs['loss_batch']:.4f} "
-                f"vol_min={epoch_avgs['cluster_volume_min']:.4f} "
-                f"vol_max={epoch_avgs['cluster_volume_max']:.4f} "
-                f"entropy={epoch_avgs['assignment_entropy']:.4f}"
+                f"loss_com={epoch_avgs['loss_com']:.4f} "
+                f"entropy={epoch_avgs['assignment_entropy']:.3f}"
             )
 
-            should_eval = (epoch_idx + 1 == self.epochs) or (
-                self.eval_interval > 0 and (epoch_idx + 1) % self.eval_interval == 0
-            )
-            if should_eval:
+            should_full_eval = (epoch_idx + 1 == self.epochs) or ((epoch_idx + 1) % full_eval_interval == 0)
+            if should_full_eval:
                 last_eval = self.evaluate_and_log(
                     epoch_idx + 1,
                     epoch_avgs,
-                    save_final=(epoch_idx + 1 == self.epochs),
+                    save_final=False,
                     num_batches=num_batches,
+                )
+            else:
+                last_eval = self.evaluate_lightweight_and_log(epoch_idx + 1, epoch_avgs)
+
+            metric_key = f"nmi_{self.main_pred_mode}"
+            current_nmi = float(last_eval["metric_row"].get(metric_key, float("nan")))
+            if epoch_idx > self.best_start_epoch and not math.isnan(current_nmi) and current_nmi > self.best_nmi:
+                self.best_nmi = current_nmi
+                self.best_epoch = epoch_idx + 1
+                self.best_metric_row = last_eval["metric_row"]
+                self._save_outputs(last_eval["predictions"], last_eval["assign"])
+                self.best_outputs_saved = True
+                row = last_eval["metric_row"]
+                print(
+                    f"[Best] epoch={self.best_epoch} {self.main_pred_mode}: "
+                    f"NMI={float(row.get(f'nmi_{self.main_pred_mode}', float('nan'))):.4f} "
+                    f"F1={float(row.get(f'f1_{self.main_pred_mode}', float('nan'))):.4f}"
                 )
 
         total_time = time.time() - total_start
+        if not self.best_outputs_saved and last_eval is not None:
+            self._save_outputs(last_eval["predictions"], last_eval["assign"])
+            self.best_metric_row = last_eval["metric_row"]
+            self.best_epoch = int(last_eval["metric_row"]["epoch"])
+            metric_key = f"nmi_{self.main_pred_mode}"
+            fallback_nmi = float(last_eval["metric_row"].get(metric_key, float("nan")))
+            self.best_nmi = fallback_nmi
+            print(
+                f"[Best] no valid labeled eval after epoch>{self.best_start_epoch}; "
+                f"saved final evaluated epoch={self.best_epoch}"
+            )
         print(f"Training finished in {total_time:.2f}s ({total_time / 60.0:.2f} min)")
         return {
             "epochs_trained": self.epochs,
+            "best_epoch": self.best_epoch,
+            "best_metric_name": f"nmi_{self.main_pred_mode}",
+            "best_nmi": self.best_nmi,
             "embedding_path": self.emb_path,
             "prediction_path": self.pred_path,
             "soft_assignment_path": self.soft_assignment_path,
             "metrics_csv_path": self.metrics_csv_path,
+            "best_eval": self.best_metric_row,
             "last_eval": last_eval["metric_row"] if last_eval is not None else None,
         }

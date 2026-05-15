@@ -36,6 +36,22 @@ def count_temporal_nodes(tadj_list: Dict[int, Dict[int, set]]) -> int:
     return (max(all_nodes) + 1) if all_nodes else 0
 
 
+def build_static_compressed_degree(tadj_list: Dict[int, Dict[int, set]], num_nodes: int) -> np.ndarray:
+    degree = np.zeros(int(num_nodes), dtype=np.float64)
+    for u, nbrs in tadj_list.items():
+        u = int(u)
+        if u < 0 or u >= num_nodes:
+            continue
+        seen = set()
+        for v in nbrs:
+            v = int(v)
+            if v == u or v < 0 or v >= num_nodes:
+                continue
+            seen.add(v)
+        degree[u] = float(len(seen))
+    return degree
+
+
 def taps_budget(args, tadj_list: Dict[int, Dict[int, set]]) -> Tuple[int, int, int]:
     static_edges = count_static_edges(tadj_list)
     num_nodes = count_temporal_nodes(tadj_list)
@@ -77,6 +93,21 @@ def build_XQ_tilde(edges: List[EdgePair], num_nodes: int) -> csr_matrix:
     nz = outdeg[rows] > 0
     data[nz] = 1.0 / outdeg[rows[nz]]
     return coo_matrix((data, (rows, cols)), shape=(num_nodes, m), dtype=np.float32).tocsr()
+
+
+def build_temporal_edge_stream(tadj_list: Dict[int, Dict[int, set]], num_nodes: int) -> List[EdgePair]:
+    edges: List[EdgePair] = []
+    for u in sorted(tadj_list):
+        u = int(u)
+        if u < 0 or u >= num_nodes:
+            continue
+        for v, times in sorted(tadj_list[u].items()):
+            v = int(v)
+            if u == v or v < 0 or v >= num_nodes:
+                continue
+            for _ in sorted(times):
+                edges.append((u, v))
+    return edges
 
 
 def build_P_from_edges(edges: List[EdgePair], num_nodes: int, weights=None) -> csr_matrix:
@@ -128,6 +159,36 @@ def tppr_truncated_with_B_XQ(
     Y.sum_duplicates()
     Y.eliminate_zeros()
     return Y
+
+
+def tppr_laplacian_with_B_XQ(
+    A_tilde: csr_matrix,
+    B: csr_matrix,
+    XQ: csr_matrix,
+    alpha: float,
+    K: int,
+    d_inv_degree: np.ndarray,
+) -> csr_matrix:
+    A_tilde = A_tilde.tocsr().astype(np.float64)
+    A_tilde.sum_duplicates()
+    A_tilde.eliminate_zeros()
+
+    laplacian_degree = np.asarray(A_tilde.sum(axis=1)).ravel()
+    d_inv_degree = np.asarray(d_inv_degree, dtype=np.float64).ravel()
+    inv_degree = np.zeros_like(d_inv_degree, dtype=np.float64)
+    mask = d_inv_degree > 0
+    inv_degree[mask] = 1.0 / d_inv_degree[mask]
+
+    D_inv = diags(inv_degree, format="csr")
+    L_tilde = (diags(laplacian_degree, format="csr") - A_tilde).tocsr()
+    S = (XQ @ B).tocsr().astype(np.float64)
+
+    alpha = float(alpha)
+    alpha_sum = sum(alpha * ((1.0 - alpha) ** r) for r in range(1, int(K) + 1))
+    tppr = (alpha * S + alpha_sum * (S - (S @ D_inv @ L_tilde))).tocsr()
+    tppr.sum_duplicates()
+    tppr.eliminate_zeros()
+    return tppr
 
 
 class TimeAwarePathSparsifier:
@@ -332,7 +393,14 @@ def compute_tppr_cached(
         edges_uvt = read_temporal_edges(file_path)
         tadj_list, T_total = compress_time_indices(edges_uvt)
 
-    tppr_cfg = {"tppr_alpha": float(args.tppr_alpha), "tppr_K": int(args.tppr_K)}
+    tppr_cfg = {
+        "tppr_alpha": float(args.tppr_alpha),
+        "tppr_K": int(args.tppr_K),
+        "method": "lapla",
+        "laplacian_source": "taps",
+        "dinv_source": "original_static_compressed",
+        "bxq_source": "original_temporal",
+    }
     taps_path, tppr_path = cache_paths(args.cache_dir, dataset, tppr_cfg, taps_cache_config(args, tadj_list))
     if os.path.exists(tppr_path):
         return load_npz(tppr_path).tocsr()
@@ -348,23 +416,14 @@ def compute_tppr_cached(
             T_total=T_total,
         )
 
+    A_time = A_time.tocsr()
     A_time.eliminate_zeros()
-    rows, cols = A_time.nonzero()
-    edges = list(zip(rows.tolist(), cols.tolist()))
-    weights = A_time.data.tolist()
 
-    B = build_B(edges, num_nodes)
-    XQ = build_XQ_tilde(edges, num_nodes)
-    P = build_P_from_edges(edges, num_nodes, weights=weights)
-
-    deg = np.asarray(P.sum(axis=1)).ravel()
-    inv_deg = np.zeros_like(deg)
-    inv_deg[deg > 0] = 1.0 / deg[deg > 0]
-    D_inv = diags(inv_deg, format="csr")
-
-    L_alpha = build_L_alpha_from_edges(edges, num_nodes, args.tppr_alpha, weights=weights)
-    D_inv_L_alpha_XQ = D_inv @ (L_alpha @ XQ)
-    tppr_mat = tppr_truncated_with_B_XQ(P, B, XQ, D_inv_L_alpha_XQ, args.tppr_alpha, args.tppr_K)
+    original_edges = build_temporal_edge_stream(tadj_list, num_nodes)
+    B = build_B(original_edges, num_nodes)
+    XQ = build_XQ_tilde(original_edges, num_nodes)
+    d_inv_degree = build_static_compressed_degree(tadj_list, num_nodes)
+    tppr_mat = tppr_laplacian_with_B_XQ(A_time, B, XQ, args.tppr_alpha, args.tppr_K, d_inv_degree)
     save_npz(tppr_path, tppr_mat.tocsr())
     return tppr_mat.tocsr()
 

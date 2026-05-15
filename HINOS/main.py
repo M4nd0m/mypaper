@@ -66,6 +66,19 @@ def get_args():
     )
     parser.add_argument("--prototype_alpha", type=float, default=1.0, help="Student-t assignment alpha")
     parser.add_argument(
+        "--batch_recon_mode",
+        type=str,
+        default="ones",
+        choices=["ones", "cebr"],
+        help="batch reconstruction objective: DTGC-style ones or community-evidence CEBR",
+    )
+    parser.add_argument(
+        "--cebr_hist_decay",
+        type=float,
+        default=0.1,
+        help="temporal decay for CEBR history reconstruction over normalized time gaps",
+    )
+    parser.add_argument(
         "--freeze_prototypes",
         action="store_true",
         help="freeze prototype centers after KMeans initialization",
@@ -83,36 +96,21 @@ def get_args():
         choices=["kmeans_z", "argmax_s", "kmeans_s", "spectral_pi", "spectral_topk_pi"],
         help="prediction method exported as the main *_pred.txt file",
     )
-    parser.add_argument("--lambda_com", type=float, default=None, help="community-aware loss weight")
+    parser.add_argument("--lambda_batch", type=float, default=1.0, help="batch reconstruction loss weight")
+    parser.add_argument("--lambda_ncut", type=float, default=0.5, help="NCut/community loss weight")
+    parser.add_argument("--lambda_ncut_orth", type=float, default=5.0, help="NCut orthogonality regularization weight")
     parser.add_argument(
-        "--lambda_community",
-        "--lambda_cut",
-        dest="lambda_community",
-        type=float,
-        default=None,
-        help="legacy alias for --lambda_com",
+        "--eval_interval",
+        type=int,
+        default=0,
+        help="full diagnostics interval; 0 uses every 5 epochs; ACC/NMI/ARI/F1 runs every epoch",
     )
-    parser.add_argument(
-        "--lambda_ncut_orth",
-        type=float,
-        default=None,
-        help="old NCut orthogonality weight",
-    )
-    parser.add_argument("--eval_interval", type=int, default=0, help="evaluation interval; 0 means final epoch only")
     parser.add_argument("--spectral_topk", type=int, default=20, help="top-k sparsification for spectral Pi diagnostics")
     parser.add_argument("--run_tag", type=str, default="", help="optional suffix for output filenames")
     return parser.parse_args()
 
 
 def apply_objective_defaults(args):
-    if args.lambda_com is None and args.lambda_community is not None:
-        args.lambda_com = args.lambda_community
-    if args.lambda_com is None:
-        args.lambda_com = 0.1
-    args.lambda_community = args.lambda_com
-    if args.lambda_ncut_orth is None:
-        args.lambda_ncut_orth = 100.0
-
     return args
 
 
@@ -130,7 +128,7 @@ def main():
     print("\n==============================")
     print(f"[RUN] dataset            = {args.dataset}")
     print(f"[RUN] objective_mode     = {args.objective_mode}")
-    print(f"[RUN] eval_interval      = {args.eval_interval if args.eval_interval > 0 else 'final-only'}")
+    print(f"[RUN] full_eval_interval = {args.eval_interval if args.eval_interval > 0 else 5}")
     print(f"[Graph] directed         = {bool(args.directed)}")
     print(f"[Device] device          = {args.device}")
     print(f"[TPPR] alpha={args.tppr_alpha}, K={args.tppr_K}")
@@ -139,8 +137,10 @@ def main():
         f"budget_beta={args.taps_budget_beta}, tau_eps={args.taps_tau_eps}, T_cap={args.taps_T_cap}"
     )
     print(
-        f"[Loss] lambda_com={args.lambda_com}, lambda_ncut_orth={args.lambda_ncut_orth}, "
-        "rec_weight=1.0, temp_weight=1.0, kl=off"
+        f"[Loss] lambda_batch={args.lambda_batch}, lambda_ncut={args.lambda_ncut}, "
+        f"lambda_ncut_orth={args.lambda_ncut_orth}, "
+        f"temp_weight=1.0, batch_recon={args.batch_recon_mode}, "
+        f"cebr_hist_decay={args.cebr_hist_decay}, kl=off"
     )
     print(
         f"[Assign] mode=prototype, prototype_alpha={args.prototype_alpha}, "
@@ -160,6 +160,16 @@ def main():
 
     print("\n========== Summary ==========")
     print(f"EpochsTrained={summary['epochs_trained']}")
+    print(f"BestEpoch={summary.get('best_epoch')}")
+    best_eval = summary.get("best_eval") or {}
+    main_pred = args.main_pred_mode
+    print(
+        f"BestResult[{main_pred}]: "
+        f"ACC={float(best_eval.get(f'acc_{main_pred}', float('nan'))):.4f}, "
+        f"NMI={float(best_eval.get(f'nmi_{main_pred}', float('nan'))):.4f}, "
+        f"ARI={float(best_eval.get(f'ari_{main_pred}', float('nan'))):.4f}, "
+        f"F1={float(best_eval.get(f'f1_{main_pred}', float('nan'))):.4f}"
+    )
     print(f"EmbeddingPath={summary['embedding_path']}")
     print(f"PredictionPath={summary['prediction_path']}")
     print(f"SoftAssignmentPath={summary['soft_assignment_path']}")
