@@ -56,6 +56,19 @@ def read_labels(label_path: str, node_dim: int) -> np.ndarray:
     return labels
 
 
+def compute_birth_time(edges_uvt: List[TemporalEdge], node_dim: int) -> np.ndarray:
+    birth_time = np.full((node_dim,), np.inf, dtype=np.float32)
+    for u, v, t in edges_uvt:
+        if 0 <= u < node_dim:
+            birth_time[u] = min(birth_time[u], float(t))
+        if 0 <= v < node_dim:
+            birth_time[v] = min(birth_time[v], float(t))
+    finite = np.isfinite(birth_time)
+    if np.any(finite):
+        birth_time[~finite] = float(np.max(birth_time[finite]) + 1.0)
+    return birth_time
+
+
 def build_static_adj(tadj_list: Dict[int, Dict[int, set]]):
     static_adj = defaultdict(list)
     for u, nbrs in tadj_list.items():
@@ -93,6 +106,7 @@ class TGCDataSet(Dataset):
         self.node2hist = {}
         self.node_set = set()
         self.degrees = {}
+        self.edges_uvt: List[TemporalEdge] = []
         self.edge_num = 0
 
         with open(file_path, "r", encoding="utf-8") as infile:
@@ -104,6 +118,9 @@ class TGCDataSet(Dataset):
                 s_node = int(parts[0])
                 t_node = int(parts[1])
                 d_time = float(parts[2])
+                if s_node == t_node:
+                    continue
+                self.edges_uvt.append((s_node, t_node, d_time))
                 self.node_set.update([s_node, t_node])
 
                 self.node2hist.setdefault(s_node, []).append((t_node, d_time))
@@ -115,6 +132,8 @@ class TGCDataSet(Dataset):
                 self.degrees[t_node] = self.degrees.get(t_node, 0) + 1
 
         self.node_dim = len(self.node_set)
+        self.birth_time = compute_birth_time(self.edges_uvt, self.node_dim)
+        self.risk_nodes_by_time = {}
         self.data_size = 0
         for s in self.node2hist:
             hist = sorted(self.node2hist[s], key=lambda x: x[1])
@@ -139,6 +158,9 @@ class TGCDataSet(Dataset):
     def get_edge_num(self) -> int:
         return self.edge_num
 
+    def get_birth_time(self) -> np.ndarray:
+        return self.birth_time.copy()
+
     def get_feature(self) -> np.ndarray:
         node_emb = {}
         with open(self.feature_path, "r", encoding="utf-8") as reader:
@@ -160,17 +182,30 @@ class TGCDataSet(Dataset):
     def init_neg_table(self) -> None:
         tot_sum = 0.0
         for k in range(self.node_dim):
-            tot_sum += np.power(self.degrees[k], self.neg_sampling_power)
+            tot_sum += np.power(self.degrees.get(k, 0), self.neg_sampling_power)
 
         n_id = 0
         cur_sum = 0.0
         por = 0.0
         for k in range(self.neg_table_size):
             if (k + 1.0) / self.neg_table_size > por:
-                cur_sum += np.power(self.degrees[n_id], self.neg_sampling_power)
+                cur_sum += np.power(self.degrees.get(n_id, 0), self.neg_sampling_power)
                 por = cur_sum / tot_sum
                 n_id += 1
             self.neg_table[k] = n_id - 1
+
+    def _risk_nodes(self, t_time: float, exclude_nodes=None) -> np.ndarray:
+        key = float(t_time)
+        if key not in self.risk_nodes_by_time:
+            self.risk_nodes_by_time[key] = np.flatnonzero(self.birth_time <= key).astype(np.int64)
+        risk_nodes = self.risk_nodes_by_time[key]
+        if exclude_nodes is None or risk_nodes.size == 0:
+            return risk_nodes
+        exclude = set(int(x) for x in exclude_nodes)
+        kept = [int(node) for node in risk_nodes.tolist() if int(node) not in exclude]
+        if kept:
+            return np.asarray(kept, dtype=np.int64)
+        return risk_nodes
 
     def __len__(self) -> int:
         return self.data_size
@@ -203,9 +238,32 @@ class TGCDataSet(Dataset):
             "history_nodes": np_h_nodes,
             "history_times": np_h_times,
             "history_masks": np_h_masks,
-            "neg_nodes": self.negative_sampling(),
+            "neg_nodes": self.negative_sampling(t_time, s_node, t_node),
+            "risk_negative_resample_count": self.last_risk_negative_resample_count,
         }
 
-    def negative_sampling(self) -> np.ndarray:
-        rand_idx = np.random.randint(0, self.neg_table_size, (self.neg_size,))
-        return self.neg_table[rand_idx]
+    def negative_sampling(self, t_time: float, source_node: int, target_node: int) -> np.ndarray:
+        negatives = []
+        resample_count = 0
+        exclude = {int(source_node), int(target_node)}
+        max_attempts = max(100, self.neg_size * 50)
+
+        while len(negatives) < self.neg_size and resample_count < max_attempts:
+            candidate = int(self.neg_table[np.random.randint(0, self.neg_table_size)])
+            resample_count += 1
+            if candidate in exclude:
+                continue
+            if self.birth_time[candidate] <= float(t_time):
+                negatives.append(candidate)
+
+        if len(negatives) < self.neg_size:
+            risk_nodes = self._risk_nodes(t_time, exclude_nodes=exclude)
+            if risk_nodes.size == 0:
+                risk_nodes = self._risk_nodes(t_time)
+            if risk_nodes.size == 0:
+                raise ValueError(f"No risk-set negative candidates are available at time {t_time}.")
+            fill = np.random.choice(risk_nodes, size=self.neg_size - len(negatives), replace=True)
+            negatives.extend(int(x) for x in fill.tolist())
+
+        self.last_risk_negative_resample_count = max(0, resample_count - self.neg_size)
+        return np.asarray(negatives, dtype=np.int64)

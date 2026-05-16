@@ -42,15 +42,32 @@ METRIC_COLUMNS = [
     "loss_com",
     "loss_ncut_orth",
     "loss_temp",
+    "loss_temp_eah",
+    "loss_temp_pos",
+    "loss_temp_neg",
     "loss_batch",
     "loss_cebr_evt",
     "loss_cebr_his",
     "loss_cebr_ce",
+    "mean_s_co_pos",
+    "mean_s_old_pos",
+    "mean_psi_pos",
+    "mean_psi_neg",
+    "mean_h_co_size_pos",
+    "mean_h_old_size_pos",
+    "ratio_empty_h_co_pos",
+    "ratio_empty_h_old_pos",
+    "ratio_new_target_events",
+    "mean_birth_time_pos_target",
+    "risk_negative_resample_count",
     "mean_g_neg",
     "mean_r_neg",
+    "lambda_temp",
+    "lambda_entry",
     "lambda_batch",
     "lambda_ncut",
     "lambda_ncut_orth",
+    "temp_loss_type",
     "prototype_alpha",
     "prototype_lr_scale",
     "cluster_volume_min",
@@ -94,6 +111,9 @@ class TGCTrainer:
         self.main_pred_mode = args.main_pred_mode
         self.freeze_prototypes = bool(args.freeze_prototypes)
         self.prototype_lr_scale = float(args.prototype_lr_scale)
+        self.temp_loss_type = args.temp_loss_type
+        self.lambda_temp = float(args.lambda_temp)
+        self.lambda_entry = float(args.lambda_entry)
 
         self.file_path = os.path.join(args.data_root, self.dataset_name, f"{self.dataset_name}.txt")
         self.label_path = os.path.join(args.data_root, self.dataset_name, "node2label.txt")
@@ -117,6 +137,11 @@ class TGCTrainer:
         )
         self.node_dim = self.data.get_node_dim()
         self.feature = self.data.get_feature().astype(np.float32)
+        birth_time = self.data.get_birth_time().astype(np.float32)
+        if birth_time.shape[0] != self.node_dim:
+            raise ValueError("birth_time length must equal node_dim.")
+        self.birth_time_np = birth_time
+        self.birth_time = torch.from_numpy(birth_time).float().to(self.device)
         self.labels = read_node_labels(self.label_path) if os.path.exists(self.label_path) else None
         self.num_clusters = self._resolve_num_clusters(int(args.num_clusters))
         self.args.resolved_num_clusters = int(self.num_clusters)
@@ -186,6 +211,9 @@ class TGCTrainer:
         print(f"[Assign] freeze_proto    = {self.freeze_prototypes}")
         print(f"[BatchRecon] mode        = {self.batch_recon_mode}")
         print(f"[BatchRecon] hist_decay  = {self.cebr_hist_decay}")
+        print(f"[Temporal] loss_type     = {self.temp_loss_type}")
+        print(f"[Temporal] lambda_temp   = {self.lambda_temp}")
+        print(f"[Temporal] lambda_entry  = {self.lambda_entry}")
         print(
             "[TPPR Diag] "
             f"purity@10={self.tppr_label_diagnostics['purity_at_10_pi']:.4f} "
@@ -416,6 +444,251 @@ class TGCTrainer:
             "mean_r_neg": r_sn.mean(),
         }
 
+    def _candidate_birth_time(self, candidate_nodes: torch.Tensor) -> torch.Tensor:
+        flat_nodes = candidate_nodes.reshape(-1)
+        return self.birth_time.index_select(0, flat_nodes).view_as(candidate_nodes).to(candidate_nodes.device)
+
+    def _hawkes_score_from_mask(
+        self,
+        s_node_emb: torch.Tensor,
+        candidate_emb: torch.Tensor,
+        candidate_nodes: torch.Tensor,
+        t_times: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        source_nodes: torch.Tensor,
+        mode: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        eps = 1e-6
+        batch, candidate_count, _ = candidate_emb.shape
+        hist_len = h_node_emb.size(1)
+
+        mu_uc = ((s_node_emb.unsqueeze(1) - candidate_emb) ** 2).sum(dim=2).neg()
+        mu_uh = ((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg()
+        mu_hc = ((h_node_emb.unsqueeze(2) - candidate_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
+
+        birth_c = self._candidate_birth_time(candidate_nodes)
+        valid_hist = (h_time_mask > 0.0) & (h_times < t_times.unsqueeze(1))
+        hist_time = h_times.unsqueeze(2).expand(batch, hist_len, candidate_count)
+        birth = birth_c.unsqueeze(1)
+        valid = valid_hist.unsqueeze(2)
+        if mode == "co":
+            hist_mask = valid & (hist_time >= birth)
+        elif mode == "old":
+            hist_mask = valid & (hist_time < birth)
+        else:
+            raise ValueError(f"Unsupported Hawkes history mode: {mode}")
+
+        exp_mu_uh = torch.exp(mu_uh).unsqueeze(2) * hist_mask.float()
+        weights = exp_mu_uh / exp_mu_uh.sum(dim=1, keepdim=True).clamp_min(eps)
+        delta = self.delta.index_select(0, source_nodes.view(-1)).view(batch, 1, 1)
+        dt = (t_times.unsqueeze(1) - h_times).clamp_min(0.0)
+        time_exponent = (-delta * dt.unsqueeze(2)).clamp(min=-50.0, max=50.0)
+        time_kernel = torch.exp(time_exponent) * hist_mask.float()
+        history = (weights * mu_hc * time_kernel).sum(dim=1)
+        return mu_uc + history, hist_mask
+
+    def _compute_eah_logit(
+        self,
+        s_nodes: torch.Tensor,
+        s_node_emb: torch.Tensor,
+        candidate_nodes: torch.Tensor,
+        candidate_emb: torch.Tensor,
+        t_times: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        s_co, co_mask = self._hawkes_score_from_mask(
+            s_node_emb,
+            candidate_emb,
+            candidate_nodes,
+            t_times,
+            h_node_emb,
+            h_times,
+            h_time_mask,
+            s_nodes,
+            mode="co",
+        )
+        s_old, old_mask = self._hawkes_score_from_mask(
+            s_node_emb,
+            candidate_emb,
+            candidate_nodes,
+            t_times,
+            h_node_emb,
+            h_times,
+            h_time_mask,
+            s_nodes,
+            mode="old",
+        )
+        if self.temp_loss_type == "eah_no_old":
+            psi = s_co
+        else:
+            psi = s_co - self.lambda_entry * (F.softplus(s_old) + F.softplus(s_old - s_co))
+        return {
+            "psi": psi,
+            "s_co": s_co,
+            "s_old": s_old,
+            "co_mask": co_mask,
+            "old_mask": old_mask,
+        }
+
+    def _compute_original_temporal_loss(
+        self,
+        s_nodes: torch.Tensor,
+        t_nodes: torch.Tensor,
+        t_times: torch.Tensor,
+        n_nodes: torch.Tensor,
+        s_node_emb: torch.Tensor,
+        t_node_emb: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        n_node_emb: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        risk_negative_resample_count: torch.Tensor,
+    ) -> Dict[str, object]:
+        att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
+        p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
+        p_alpha = ((h_node_emb - t_node_emb.unsqueeze(1)) ** 2).sum(dim=2).neg()
+        delta = self.delta.index_select(0, s_nodes.view(-1)).unsqueeze(1)
+        d_time = torch.abs(t_times.unsqueeze(1) - h_times)
+        p_lambda = p_mu + (att * p_alpha * torch.exp(delta * d_time) * h_time_mask).sum(dim=1)
+
+        n_mu = ((s_node_emb.unsqueeze(1) - n_node_emb) ** 2).sum(dim=2).neg()
+        n_alpha = ((h_node_emb.unsqueeze(2) - n_node_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
+        time_decay = torch.exp(delta * d_time).unsqueeze(2)
+        n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * time_decay * h_time_mask.unsqueeze(2)).sum(dim=1)
+        loss_pos_per_event = -F.logsigmoid(p_lambda)
+        loss_neg_per_event = -F.logsigmoid(-n_lambda).sum(dim=1)
+        l_temp = (loss_pos_per_event + loss_neg_per_event).mean()
+        birth_pos = self.birth_time.index_select(0, t_nodes.view(-1))
+        return {
+            "loss_temp": l_temp,
+            "loss_temp_eah": l_temp,
+            "loss_temp_pos": loss_pos_per_event.mean(),
+            "loss_temp_neg": loss_neg_per_event.mean(),
+            "mean_s_co_pos": p_lambda.mean(),
+            "mean_s_old_pos": torch.tensor(float("nan"), device=self.device),
+            "mean_psi_pos": p_lambda.mean(),
+            "mean_psi_neg": n_lambda.mean(),
+            "mean_h_co_size_pos": torch.tensor(float("nan"), device=self.device),
+            "mean_h_old_size_pos": torch.tensor(float("nan"), device=self.device),
+            "ratio_empty_h_co_pos": torch.tensor(float("nan"), device=self.device),
+            "ratio_empty_h_old_pos": torch.tensor(float("nan"), device=self.device),
+            "ratio_new_target_events": (birth_pos == t_times).float().mean(),
+            "mean_birth_time_pos_target": birth_pos.float().mean(),
+            "risk_negative_resample_count": risk_negative_resample_count.float().mean(),
+        }
+
+    def _compute_eah_temporal_loss(
+        self,
+        s_nodes: torch.Tensor,
+        t_nodes: torch.Tensor,
+        t_times: torch.Tensor,
+        n_nodes: torch.Tensor,
+        s_node_emb: torch.Tensor,
+        t_node_emb: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        n_node_emb: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        risk_negative_resample_count: torch.Tensor,
+    ) -> Dict[str, object]:
+        pos = self._compute_eah_logit(
+            s_nodes,
+            s_node_emb,
+            t_nodes.view(-1, 1),
+            t_node_emb.unsqueeze(1),
+            t_times,
+            h_node_emb,
+            h_times,
+            h_time_mask,
+        )
+        neg = self._compute_eah_logit(
+            s_nodes,
+            s_node_emb,
+            n_nodes,
+            n_node_emb,
+            t_times,
+            h_node_emb,
+            h_times,
+            h_time_mask,
+        )
+        psi_pos = pos["psi"].squeeze(1)
+        psi_neg = neg["psi"]
+        loss_pos_per_event = -F.logsigmoid(psi_pos)
+        loss_neg_per_event = -F.logsigmoid(-psi_neg).sum(dim=1)
+        l_temp = (loss_pos_per_event + loss_neg_per_event).mean()
+
+        h_co_size_pos = pos["co_mask"].squeeze(2).float().sum(dim=1)
+        h_old_size_pos = pos["old_mask"].squeeze(2).float().sum(dim=1)
+        birth_pos = self.birth_time.index_select(0, t_nodes.view(-1))
+        return {
+            "loss_temp": l_temp,
+            "loss_temp_eah": l_temp,
+            "loss_temp_pos": loss_pos_per_event.mean(),
+            "loss_temp_neg": loss_neg_per_event.mean(),
+            "mean_s_co_pos": pos["s_co"].mean(),
+            "mean_s_old_pos": pos["s_old"].mean(),
+            "mean_psi_pos": psi_pos.mean(),
+            "mean_psi_neg": psi_neg.mean(),
+            "mean_h_co_size_pos": h_co_size_pos.mean(),
+            "mean_h_old_size_pos": h_old_size_pos.mean(),
+            "ratio_empty_h_co_pos": (h_co_size_pos == 0).float().mean(),
+            "ratio_empty_h_old_pos": (h_old_size_pos == 0).float().mean(),
+            "ratio_new_target_events": (birth_pos == t_times).float().mean(),
+            "mean_birth_time_pos_target": birth_pos.float().mean(),
+            "risk_negative_resample_count": risk_negative_resample_count.float().mean(),
+        }
+
+    def compute_eah_temporal_loss(
+        self,
+        s_nodes: torch.Tensor,
+        t_nodes: torch.Tensor,
+        t_times: torch.Tensor,
+        n_nodes: torch.Tensor,
+        s_node_emb: torch.Tensor,
+        t_node_emb: torch.Tensor,
+        h_node_emb: torch.Tensor,
+        n_node_emb: torch.Tensor,
+        h_times: torch.Tensor,
+        h_time_mask: torch.Tensor,
+        risk_negative_resample_count: torch.Tensor,
+    ) -> Dict[str, object]:
+        neg_birth = self.birth_time.index_select(0, n_nodes.reshape(-1)).view_as(n_nodes)
+        if torch.any(neg_birth > t_times.unsqueeze(1)):
+            raise ValueError("Risk-set negative sampling produced a node with birth_time > target_time.")
+        if self.temp_loss_type == "original":
+            return self._compute_original_temporal_loss(
+                s_nodes,
+                t_nodes,
+                t_times,
+                n_nodes,
+                s_node_emb,
+                t_node_emb,
+                h_node_emb,
+                n_node_emb,
+                h_times,
+                h_time_mask,
+                risk_negative_resample_count,
+            )
+        if self.temp_loss_type not in {"eah", "eah_no_old"}:
+            raise ValueError(f"Unsupported temp_loss_type: {self.temp_loss_type}")
+        return self._compute_eah_temporal_loss(
+            s_nodes,
+            t_nodes,
+            t_times,
+            n_nodes,
+            s_node_emb,
+            t_node_emb,
+            h_node_emb,
+            n_node_emb,
+            h_times,
+            h_time_mask,
+            risk_negative_resample_count,
+        )
+
     def _loss_phase(self, epoch_idx: int) -> str:
         return self.objective_mode
 
@@ -428,6 +701,7 @@ class TGCTrainer:
         h_nodes: torch.Tensor,
         h_times: torch.Tensor,
         h_time_mask: torch.Tensor,
+        risk_negative_resample_count: torch.Tensor,
         num_batches: int = 1,
     ) -> Dict[str, object]:
         batch = s_nodes.size(0)
@@ -453,24 +727,26 @@ class TGCTrainer:
         )
         l_rec = batch_recon["loss_batch"]
 
-        att = F.softmax(((s_node_emb.unsqueeze(1) - h_node_emb) ** 2).sum(dim=2).neg(), dim=1)
-        p_mu = ((s_node_emb - t_node_emb) ** 2).sum(dim=1).neg()
-        p_alpha = ((h_node_emb - t_node_emb.unsqueeze(1)) ** 2).sum(dim=2).neg()
-        delta = self.delta.index_select(0, s_nodes.view(-1)).unsqueeze(1)
-        d_time = torch.abs(t_times.unsqueeze(1) - h_times)
-        p_lambda = p_mu + (att * p_alpha * torch.exp(delta * d_time) * h_time_mask).sum(dim=1)
-
-        n_mu = ((s_node_emb.unsqueeze(1) - n_node_emb) ** 2).sum(dim=2).neg()
-        n_alpha = ((h_node_emb.unsqueeze(2) - n_node_emb.unsqueeze(1)) ** 2).sum(dim=3).neg()
-        time_decay = torch.exp(delta * d_time).unsqueeze(2)
-        n_lambda = n_mu + (att.unsqueeze(2) * n_alpha * time_decay * h_time_mask.unsqueeze(2)).sum(dim=1)
-        loss_pair = -torch.log(p_lambda.sigmoid() + eps) - torch.log(n_lambda.neg().sigmoid() + eps).sum(dim=1)
-        l_temp = loss_pair.mean()
+        temporal = self.compute_eah_temporal_loss(
+            s_nodes,
+            t_nodes,
+            t_times,
+            n_nodes,
+            s_node_emb,
+            t_node_emb,
+            h_node_emb,
+            n_node_emb,
+            h_times,
+            h_time_mask,
+            risk_negative_resample_count,
+        )
+        l_temp = temporal["loss_temp"]
 
         l_ncut, l_cut_base, l_ncut_orth = self._compute_search_ncut(assign)
         weighted_batch = self.lambda_batch * l_rec
+        weighted_temp = self.lambda_temp * l_temp
         weighted_ncut = self.lambda_ncut * l_ncut
-        loss_total = weighted_batch + l_temp + weighted_ncut
+        loss_total = weighted_batch + weighted_temp + weighted_ncut
 
         degree = self.full_ncut_degree
         cluster_mass = assign.sum(dim=0)
@@ -488,17 +764,31 @@ class TGCTrainer:
             "loss_cut_base": l_cut_base,
             "loss_ncut_orth": l_ncut_orth,
             "loss_temp": l_temp,
+            "loss_temp_eah": temporal["loss_temp_eah"],
+            "loss_temp_pos": temporal["loss_temp_pos"],
+            "loss_temp_neg": temporal["loss_temp_neg"],
             "loss_batch": l_rec,
             "loss_cebr_evt": batch_recon["loss_cebr_evt"],
             "loss_cebr_his": batch_recon["loss_cebr_his"],
             "loss_cebr_ce": batch_recon["loss_cebr_ce"],
+            "mean_s_co_pos": temporal["mean_s_co_pos"],
+            "mean_s_old_pos": temporal["mean_s_old_pos"],
+            "mean_psi_pos": temporal["mean_psi_pos"],
+            "mean_psi_neg": temporal["mean_psi_neg"],
+            "mean_h_co_size_pos": temporal["mean_h_co_size_pos"],
+            "mean_h_old_size_pos": temporal["mean_h_old_size_pos"],
+            "ratio_empty_h_co_pos": temporal["ratio_empty_h_co_pos"],
+            "ratio_empty_h_old_pos": temporal["ratio_empty_h_old_pos"],
+            "ratio_new_target_events": temporal["ratio_new_target_events"],
+            "mean_birth_time_pos_target": temporal["mean_birth_time_pos_target"],
+            "risk_negative_resample_count": temporal["risk_negative_resample_count"],
             "mean_g_neg": float(batch_recon["mean_g_neg"].detach().item()),
             "mean_r_neg": float(batch_recon["mean_r_neg"].detach().item()),
             "weighted_ncut": weighted_ncut,
             "weighted_cut_base": self.lambda_ncut * l_cut_base,
             "weighted_cut": self.lambda_ncut * l_cut_base,
             "weighted_ncut_orth": self.lambda_ncut * self.lambda_ncut_orth * l_ncut_orth,
-            "weighted_temp": l_temp,
+            "weighted_temp": weighted_temp,
             "weighted_batch": weighted_batch,
             "cluster_mass": cluster_mass.detach().cpu().numpy(),
             "cluster_volume": cluster_volume.detach().cpu().numpy(),
@@ -517,6 +807,7 @@ class TGCTrainer:
         h_nodes: torch.Tensor,
         h_times: torch.Tensor,
         h_time_mask: torch.Tensor,
+        risk_negative_resample_count: torch.Tensor,
         epoch_idx: int,
         num_batches: int = 1,
     ) -> Dict[str, object]:
@@ -528,6 +819,7 @@ class TGCTrainer:
             h_nodes,
             h_times,
             h_time_mask,
+            risk_negative_resample_count,
             num_batches=num_batches,
         )
 
@@ -540,6 +832,7 @@ class TGCTrainer:
             sample["history_nodes"].long().to(self.device),
             sample["history_times"].float().to(self.device),
             sample["history_masks"].float().to(self.device),
+            sample["risk_negative_resample_count"].float().to(self.device),
         )
 
     def update(self, batch_tensors: Tuple[torch.Tensor, ...], epoch_idx: int, num_batches: int = 1) -> Dict[str, float]:
@@ -547,6 +840,12 @@ class TGCTrainer:
         loss_terms = self.compute_loss_terms(*batch_tensors, epoch_idx, num_batches=num_batches)
         loss_terms["loss_total"].backward()
         self.opt.step()
+        def scalar(name: str) -> float:
+            value = loss_terms[name]
+            if isinstance(value, torch.Tensor):
+                return float(value.item())
+            return float(value)
+
         return {
             "loss_total": float(loss_terms["loss_total"].item()),
             "loss_tppr_cut": float(loss_terms["loss_tppr_cut"].item()),
@@ -555,10 +854,24 @@ class TGCTrainer:
             "loss_cut_base": float(loss_terms["loss_cut_base"].item()),
             "loss_ncut_orth": float(loss_terms["loss_ncut_orth"].item()),
             "loss_temp": float(loss_terms["loss_temp"].item()),
+            "loss_temp_eah": scalar("loss_temp_eah"),
+            "loss_temp_pos": scalar("loss_temp_pos"),
+            "loss_temp_neg": scalar("loss_temp_neg"),
             "loss_batch": float(loss_terms["loss_batch"].item()),
             "loss_cebr_evt": float(loss_terms["loss_cebr_evt"].item()),
             "loss_cebr_his": float(loss_terms["loss_cebr_his"].item()),
             "loss_cebr_ce": float(loss_terms["loss_cebr_ce"].item()),
+            "mean_s_co_pos": scalar("mean_s_co_pos"),
+            "mean_s_old_pos": scalar("mean_s_old_pos"),
+            "mean_psi_pos": scalar("mean_psi_pos"),
+            "mean_psi_neg": scalar("mean_psi_neg"),
+            "mean_h_co_size_pos": scalar("mean_h_co_size_pos"),
+            "mean_h_old_size_pos": scalar("mean_h_old_size_pos"),
+            "ratio_empty_h_co_pos": scalar("ratio_empty_h_co_pos"),
+            "ratio_empty_h_old_pos": scalar("ratio_empty_h_old_pos"),
+            "ratio_new_target_events": scalar("ratio_new_target_events"),
+            "mean_birth_time_pos_target": scalar("mean_birth_time_pos_target"),
+            "risk_negative_resample_count": scalar("risk_negative_resample_count"),
             "mean_g_neg": float(loss_terms["mean_g_neg"]),
             "mean_r_neg": float(loss_terms["mean_r_neg"]),
             "effective_lambda_ncut": float(loss_terms["effective_lambda_ncut"]),
@@ -667,15 +980,32 @@ class TGCTrainer:
                 "loss_com": epoch_stats["loss_com"],
                 "loss_ncut_orth": epoch_stats.get("loss_ncut_orth", float("nan")),
                 "loss_temp": epoch_stats["loss_temp"],
+                "loss_temp_eah": epoch_stats.get("loss_temp_eah", float("nan")),
+                "loss_temp_pos": epoch_stats.get("loss_temp_pos", float("nan")),
+                "loss_temp_neg": epoch_stats.get("loss_temp_neg", float("nan")),
                 "loss_batch": epoch_stats["loss_batch"],
                 "loss_cebr_evt": epoch_stats.get("loss_cebr_evt", float("nan")),
                 "loss_cebr_his": epoch_stats.get("loss_cebr_his", float("nan")),
                 "loss_cebr_ce": epoch_stats.get("loss_cebr_ce", float("nan")),
+                "mean_s_co_pos": epoch_stats.get("mean_s_co_pos", float("nan")),
+                "mean_s_old_pos": epoch_stats.get("mean_s_old_pos", float("nan")),
+                "mean_psi_pos": epoch_stats.get("mean_psi_pos", float("nan")),
+                "mean_psi_neg": epoch_stats.get("mean_psi_neg", float("nan")),
+                "mean_h_co_size_pos": epoch_stats.get("mean_h_co_size_pos", float("nan")),
+                "mean_h_old_size_pos": epoch_stats.get("mean_h_old_size_pos", float("nan")),
+                "ratio_empty_h_co_pos": epoch_stats.get("ratio_empty_h_co_pos", float("nan")),
+                "ratio_empty_h_old_pos": epoch_stats.get("ratio_empty_h_old_pos", float("nan")),
+                "ratio_new_target_events": epoch_stats.get("ratio_new_target_events", float("nan")),
+                "mean_birth_time_pos_target": epoch_stats.get("mean_birth_time_pos_target", float("nan")),
+                "risk_negative_resample_count": epoch_stats.get("risk_negative_resample_count", float("nan")),
                 "mean_g_neg": epoch_stats.get("mean_g_neg", float("nan")),
                 "mean_r_neg": epoch_stats.get("mean_r_neg", float("nan")),
+                "lambda_temp": self.lambda_temp,
+                "lambda_entry": self.lambda_entry,
                 "lambda_batch": self.lambda_batch,
                 "lambda_ncut": self.lambda_ncut,
                 "lambda_ncut_orth": self.lambda_ncut_orth,
+                "temp_loss_type": self.temp_loss_type,
                 "prototype_alpha": self.prototype_alpha,
                 "prototype_lr_scale": self.prototype_lr_scale,
                 "cluster_volume_min": epoch_stats["cluster_volume_min"],
@@ -804,10 +1134,24 @@ class TGCTrainer:
                 "loss_cut_base": 0.0,
                 "loss_ncut_orth": 0.0,
                 "loss_temp": 0.0,
+                "loss_temp_eah": 0.0,
+                "loss_temp_pos": 0.0,
+                "loss_temp_neg": 0.0,
                 "loss_batch": 0.0,
                 "loss_cebr_evt": 0.0,
                 "loss_cebr_his": 0.0,
                 "loss_cebr_ce": 0.0,
+                "mean_s_co_pos": 0.0,
+                "mean_s_old_pos": 0.0,
+                "mean_psi_pos": 0.0,
+                "mean_psi_neg": 0.0,
+                "mean_h_co_size_pos": 0.0,
+                "mean_h_old_size_pos": 0.0,
+                "ratio_empty_h_co_pos": 0.0,
+                "ratio_empty_h_old_pos": 0.0,
+                "ratio_new_target_events": 0.0,
+                "mean_birth_time_pos_target": 0.0,
+                "risk_negative_resample_count": 0.0,
                 "mean_g_neg": 0.0,
                 "mean_r_neg": 0.0,
                 "effective_lambda_ncut": 0.0,

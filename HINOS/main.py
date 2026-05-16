@@ -97,8 +97,22 @@ def get_args():
         help="prediction method exported as the main *_pred.txt file",
     )
     parser.add_argument("--lambda_batch", type=float, default=1.0, help="batch reconstruction loss weight")
+    parser.add_argument("--lambda_temp", type=float, default=1.0, help="temporal loss weight")
     parser.add_argument("--lambda_ncut", type=float, default=0.5, help="NCut/community loss weight")
     parser.add_argument("--lambda_ncut_orth", type=float, default=5.0, help="NCut orthogonality regularization weight")
+    parser.add_argument(
+        "--temp_loss_type",
+        type=str,
+        default="eah",
+        choices=["original", "eah", "eah_no_old"],
+        help="temporal loss: original Hawkes, full entry-adjusted counterfactual Hawkes, or co-entry only",
+    )
+    parser.add_argument(
+        "--lambda_entry",
+        type=float,
+        default=0.1,
+        help="counterfactual old-history penalty weight for EAH temporal loss",
+    )
     parser.add_argument(
         "--eval_interval",
         type=int,
@@ -139,8 +153,9 @@ def main():
     print(
         f"[Loss] lambda_batch={args.lambda_batch}, lambda_ncut={args.lambda_ncut}, "
         f"lambda_ncut_orth={args.lambda_ncut_orth}, "
-        f"temp_weight=1.0, batch_recon={args.batch_recon_mode}, "
-        f"cebr_hist_decay={args.cebr_hist_decay}, kl=off"
+        f"lambda_temp={args.lambda_temp}, batch_recon={args.batch_recon_mode}, "
+        f"cebr_hist_decay={args.cebr_hist_decay}, temp_loss={args.temp_loss_type}, "
+        f"lambda_entry={args.lambda_entry}, kl=off"
     )
     print(
         f"[Assign] mode=prototype, prototype_alpha={args.prototype_alpha}, "
